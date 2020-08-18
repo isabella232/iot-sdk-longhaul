@@ -2,6 +2,10 @@
 
 This repo holds source code used in SDK long-haul evaluation, and meant to be good examples of well-written device and service code.
 
+## Data collection
+
+This software collects information about the environment and the operational success and sends it to an IoT Hub and an Application Insights instance of your choosing.
+
 ## Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
