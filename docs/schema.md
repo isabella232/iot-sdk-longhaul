@@ -16,7 +16,7 @@
 Desired:
 ```json
 {
-  "longhaulTelemetrySendInterval": 10
+  "longhaulTelemetrySendIntervalInSeconds": 11
 }
 ```
 
@@ -29,7 +29,7 @@ Reported:
   "osVersion": "#34~18.04.2-Ubuntu SMP Thu Oct 10 10:36:02 UTC 2019",
 
   "systemArchitecture": "x86_64",
-  "totalSystemMemory": 8192,
+  "totalSystemMemoryInMb": 8192,
 
   "runStart": "2020-07-12 14:14:00",
   "runEnd": "2020-07-17 14:15:321",
@@ -39,7 +39,7 @@ Reported:
   "sdkRepo": "Azure/azure-iot-sdk-python",
   "sdkSha": "12fad0147368eee0708c5039cfc3ab6aa0b781ae",
   "sdkBranch": "master", 
-  "sdvVersion": "2.1.2",
+  "sdkVersion": "2.1.2",
 
   "transport": "mqtt"
 }
@@ -50,8 +50,8 @@ Reported:
 Desired:
 ```json
 {
-  "d2cTimeoutInterval": 30,
-  "d2cSendFrequency": 10,
+  "d2cTimeoutIntervalInSeconds": 30,
+  "d2cSendsPerSecond": 10,
   "d2cFailuresAllowed": 0
 }
 ```
@@ -76,17 +76,17 @@ System telemetry, sent according to longhaulTelemetrySendInterval
   "processCpuUsagePercent": 25.3,
   "processInvoluntaryContextSwitchesPerSecond": 2999.9,
   "processVoluntaryContextSwitchesPerSecond": 302.7,
-  "processResidentMemory": 109.2,
-  "processAvailableMemory":72.2,  
-  "systemAvailableMemory": 3096,
-  "systemFreeMemory": 2096
+  "processResidentMemoryInMb": 109.2,
+  "processAvailableMemoryInMb":72.2,  
+  "systemAvailableMemoryInMb": 3096,
+  "systemFreeMemoryInMb": 2096
 }
 ```
 
 D2C telemetry, sent according to longhaulTelemetrySendInterval
 ```json
 {
-  "averageD2cRoundtripLatencyToGateway": 0.257, 
+  "averageD2cRoundtripLatencyToGatewayInSeconds": 0.257, 
   "d2cInFlightCount": 2
 }
 ```
