@@ -1,0 +1,5 @@
+inflection
+opencensus-ext-azure
+azure-iot-device
+azure-iot-hub
+

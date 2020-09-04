@@ -4,7 +4,7 @@
 import statistics
 import threading
 import contextlib
-import datetime
+import time
 
 
 class ThreadSafeCounter(object):
@@ -68,6 +68,10 @@ class ThreadSafeList(object):
             self.list = []
             return old_list
 
+    def get_len(self):
+        with self.lock:
+            return len(self.list)
+
 
 class MeasureLatency(contextlib.AbstractContextManager):
     def __init__(self, tracker=None):
@@ -76,18 +80,18 @@ class MeasureLatency(contextlib.AbstractContextManager):
         self.tracker = tracker
 
     def __enter__(self):
-        self.start_time = datetime.datetime.now()
+        self.start_time = time.time()
 
     def __exit__(self, *args):
-        self.end_time = datetime.datetime.now()
+        self.end_time = time.time()
         if self.tracker:
             self.tracker.add_sample(self.get_latency())
 
     def get_latency(self):
         if self.start_time:
             if self.end_time:
-                return (self.end_time - self.start_time).total_seconds()
+                return self.end_time - self.start_time
             else:
-                return (datetime.datetime.now() - self.start_time).total_seconds()
+                return time.time() - self.start_time
         else:
             return 0

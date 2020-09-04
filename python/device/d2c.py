@@ -9,10 +9,12 @@ import data_model
 import uuid
 import json
 import datetime
+import threading
 from measurement import ThreadSafeCounter, ThreadSafeList, MeasureLatency
 from concurrent.futures import ThreadPoolExecutor
+import dps
 
-from azure.iot.device import IoTHubDeviceClient, Message
+from azure.iot.device import Message
 
 logging.basicConfig(level=logging.ERROR)
 # logging.getLogger("paho").setLevel(level=logging.DEBUG)
@@ -20,11 +22,15 @@ logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 logger.setLevel(level=logging.DEBUG)
 
+WAITING = "waiting"
 RUNNING = "running"
 FAILED = "failed"
 COMPLETE = "complete"
 
-connection_string = os.environ["IOTHUB_DEVICE_CONNECTION_STRING"]
+provisioning_host = os.getenv("LONGHAUL_PROVISIONING_HOST")
+id_scope = os.getenv("LONGHAUL_ID_SCOPE")
+group_symmetric_key = os.getenv("LONGHAUL_GROUP_SYMMETRIC_KEY")
+registration_id = "bertk-longhaul"
 
 
 class OperationMetric:
@@ -36,6 +42,7 @@ class OperationMetric:
         self.inflight = ThreadSafeCounter()
         self.succeeded = ThreadSafeCounter()
         self.failed = ThreadSafeCounter()
+        self.verified = ThreadSafeCounter()
         self.total_succeeded = ThreadSafeCounter()
         self.total_failed = ThreadSafeCounter()
         self.latency = ThreadSafeList()
@@ -61,7 +68,7 @@ class LongHaulMetrics(object):
         self.d2c = OperationMetric()
         self.run_start = None
         self.run_end = None
-        self.run_state = "waiting"
+        self.run_state = WAITING
 
 
 class LongHaulConfig(object):
@@ -75,11 +82,11 @@ class LongHaulConfig(object):
         self.d2c = OperationConfig()
 
 
-def make_new_d2c_payload():
+def make_new_d2c_payload(message_id):
     """
     Helper function to create a unique payload which can be sent up as d2c message
     """
-    msg = {"message_id": str(uuid.uuid4()), "lh_send_response": True}
+    msg = {"message_id": message_id, "lh_send_response": True}
     return Message(json.dumps(msg))
 
 
@@ -113,6 +120,10 @@ class App(object):
         self.currently_running_operations = ThreadSafeList()
         self.metrics = LongHaulMetrics()
         self.config = LongHaulConfig()
+        self.d2c_set_lock = threading.Lock()
+        self.d2c_confirmed = set()
+        self.d2c_unconfirmed = set()
+        self.done = False
 
     def update_initial_properties(self):
         """
@@ -129,7 +140,7 @@ class App(object):
         p.total_system_memory_in_mb = 0
 
         p.run_start = datetime.datetime.now()
-        p.run_state = "waiting"
+        p.run_state = WAITING
 
         p.sdk_language = "python"
         p.sdk_repo = ""
@@ -149,7 +160,8 @@ class App(object):
         """
 
         def send_single_d2c_message():
-            data = make_new_d2c_payload()
+            message_id = str(uuid.uuid4())
+            data = make_new_d2c_payload(message_id)
             latency = MeasureLatency()
 
             try:
@@ -157,6 +169,8 @@ class App(object):
                 with latency:
                     self.client.send_message(data)
                 metrics.latency.append(latency.get_latency())
+                with self.d2c_set_lock:
+                    self.d2c_unconfirmed.add(message_id)
 
             finally:
                 metrics.inflight.decrement()
@@ -247,11 +261,21 @@ class App(object):
         """
         Thread which continuously receives c2d messages throughout the test run
         """
-        done = False
-        while not done:
-            print("waiting")
+        while not self.done:
             msg = self.client.receive_message()
-            print(msg.__dict__)
+
+            obj = json.loads(msg.data.decode())
+            if obj.get("lh_response"):
+                list = obj.get("message_ids")
+                if list:
+                    with self.d2c_set_lock:
+                        for message_id in list:
+                            self.d2c_confirmed.add(message_id)
+                        remove = self.d2c_confirmed & self.d2c_unconfirmed
+                        print("received {} items.  Removed {}".format(len(list), len(remove)))
+                        self.metrics.d2c.verified.add(len(remove))
+                        self.d2c_confirmed -= remove
+                        self.d2c_unconfirmed -= remove
 
     def main(self):
         # collection of Future objects for all of the threads that are running continuously
@@ -261,7 +285,12 @@ class App(object):
         unpack_config(self.config)
 
         # Create our client and push initial properties
-        self.client = IoTHubDeviceClient.create_from_connection_string(connection_string)
+        self.client = dps.create_device_client_using_dps_group_key(
+            provisioning_host=provisioning_host,
+            registration_id=registration_id,
+            id_scope=id_scope,
+            group_symmetric_key=group_symmetric_key,
+        )
         self.update_initial_properties()
 
         # Spin up our worker threads.
@@ -290,19 +319,25 @@ class App(object):
                         try:
                             future.result()
                         except Exception as e:
+                            logger.error("Error in future", exc_info=True)
                             error = e
+
                 if error:
                     raise error
 
                 # check for completed operations.  Count failures, but don't fail unless
                 # we exceeed the limit
                 for future in self.currently_running_operations.extract_list():
+                    future_succeeded = False
                     future_failed = False
                     if future.done():
                         end_time = future.result()
                         if end_time > future.timeout_time:
                             future_failed = True
+                        else:
+                            future_succeeded = True
                     elif time.time() > future.timeout_time:
+                        print("Timeout on running operation")
                         future_failed = True
                     else:
                         self.currently_running_operations.append(future)
@@ -312,11 +347,12 @@ class App(object):
                         future.metrics.total_failed.increment()
                         if future.metrics.failed.get_count() > future.config.failures_allowed:
                             raise Exception("Failure count exceeded")
-                    else:
+                    elif future_succeeded:
                         future.metrics.succeeded.increment()
                         future.metrics.total_succeeded.increment()
 
         except Exception:
+            logger.error("Error in main", exc_info=True)
             self.metrics.run_state = FAILED
             raise
         else:

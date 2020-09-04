@@ -1,0 +1,11 @@
+ARG BASE
+FROM ${BASE}
+
+RUN pip install azure-iot-device
+
+COPY device/* /device/
+COPY containers/fetch-device-secrets.sh /
+COPY containers/run-device.sh /
+
+CMD ["/bin/bash", "/run-device.sh"]
+

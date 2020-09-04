@@ -30,7 +30,7 @@ class SimpleObject(object):
     def __init__(self):
         self._attributes_locked = False
 
-    def _get_attribute_names(self):
+    def get_attribute_names(self):
         """
         return all public attribute names for this object.  Excludes all callables and all
         attributes that start wth an underscore.
@@ -43,7 +43,7 @@ class SimpleObject(object):
         attributes to the object.
         """
         self._attributes_locked = True
-        for name in self._get_attribute_names():
+        for name in self.get_attribute_names():
             sub = getattr(self, name)
             if isinstance(sub, SimpleObject):
                 sub.freeze_attributes()
@@ -131,7 +131,7 @@ class DictionaryObject(SimpleObject):
 
         def dict_from_native_object(native_object, default_object):
             dict_object = {}
-            for native_key in native_object._get_attribute_names():
+            for native_key in native_object.get_attribute_names():
                 dict_key = inflection.camelize(native_key, uppercase_first_letter=False)
 
                 default_value = None

@@ -1,0 +1,23 @@
+ARG BASE=python:3.8.5-slim-buster
+FROM ${BASE} 
+
+RUN apt-get update \
+    && apt-get -y install --no-install-recommends \
+        git \
+        curl \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY device/requirements.txt /requirements.txt
+
+RUN apt-get update \
+    && apt-get -y install --no-install-recommends gcc python-dev \
+    && pip install -r /requirements.txt \
+    && apt-get -y remove gcc python-dev \
+    && apt-get -y autoremove \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip uninstall -y azure-iot-device azure-iot-hub
+
+
+
+
