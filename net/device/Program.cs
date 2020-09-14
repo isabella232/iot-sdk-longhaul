@@ -33,11 +33,15 @@ namespace ThiefDevice
 
             await _iotHub.InitializeAsync().ConfigureAwait(false);
             using CancellationTokenSource cancellationTokenSource = ConfigureAppExit();
-            var systemHealthMonitor = new SystemHealthMonitor(_iotHub, _logger);
+            var systemHealthMonitor = new SystemHealthMonitor(_iotHub, _logger.Clone());
 
             try
             {
-                await Task.WhenAll(systemHealthMonitor.RunAsync(cancellationTokenSource.Token)).ConfigureAwait(false);
+                await Task
+                    .WhenAll(
+                        systemHealthMonitor.RunAsync(cancellationTokenSource.Token),
+                        _iotHub.RunAsync(cancellationTokenSource.Token))
+                    .ConfigureAwait(false);
             }
             catch (TaskCanceledException) { } // user signalled an exit
 
@@ -90,7 +94,7 @@ namespace ThiefDevice
             {
                 logBuilder.AppContext.Add(kvp.Key, kvp.Value);
             }
-            logBuilder.LogProviders.Add(new ConsoleLogProvider());
+            logBuilder.LogProviders.Add(new ConsoleLogProvider { ShouldLogContext = false, ShouldUseColor = true });
             logBuilder.LogProviders.Add(new ApplicationInsightsLoggingProvider(aiKey));
 
             var logger = logBuilder.BuildLogger();

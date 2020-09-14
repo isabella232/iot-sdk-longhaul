@@ -1,9 +1,12 @@
 ﻿using Mash.Logging;
 using Microsoft.Azure.Devices.Client;
+using Microsoft.Azure.Devices.Client.Exceptions;
 using Microsoft.Azure.Devices.Shared;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -25,7 +28,15 @@ namespace Microsoft.Azure.Iot.Thief.Device
         private volatile bool _isConnected;
         private volatile bool _wasEverConnected;
         private volatile ConnectionStatus _connectionStatus;
+        private volatile int _connectionStatusChangeCount = 0;
+        private readonly Stopwatch _disconnectedTimer = new Stopwatch();
+        private ConnectionStatus _disconnectedStatus;
+        private ConnectionStatusChangeReason _disconnectedReason;
         private volatile DeviceClient _deviceClient;
+
+        private readonly ConcurrentQueue<Message> _messagesToSend = new ConcurrentQueue<Message>();
+        private readonly List<Message> _pendingMessages = new List<Message>();
+        private long _totalMessagesSent = 0;
 
         private static readonly JsonSerializerOptions _jsonSerializerOptions = new JsonSerializerOptions { IgnoreNullValues = true };
 
@@ -45,7 +56,8 @@ namespace Microsoft.Azure.Iot.Thief.Device
 
             try
             {
-                if (Cleanup())
+                if (_deviceClient == null
+                    || ResetClient())
                 {
                     _deviceClient = DeviceClient.CreateFromConnectionString(_deviceConnectionString, _transportType);
                     _deviceClient.SetConnectionStatusChangesHandler(ConnectionStatusChangesHandler);
@@ -58,27 +70,97 @@ namespace Microsoft.Azure.Iot.Thief.Device
             }
         }
 
-        public bool Cleanup(bool force = false)
+        public async Task RunAsync(CancellationToken ct)
         {
-            if (_deviceClient != null
-                && _wasEverConnected
-                && (force || _connectionStatus == ConnectionStatus.Disconnected))
+            while (!ct.IsCancellationRequested)
             {
-                _deviceClient.Dispose();
-                _deviceClient = null;
-                _wasEverConnected = false;
-                _logger.Trace($"IotHub cleaned up");
-                return true;
-            }
+                // Wait when there are few messages to send, or if not connected
+                if (_messagesToSend.Count < 10
+                    || !_isConnected)
+                {
+                    try
+                    {
+                        await Task.Delay(60000, ct).ConfigureAwait(false);
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        // App is signalled to exit
+                        return;
+                    }
+                }
 
-            _logger.Trace($"IotHub not cleaned up: device client instance {_deviceClient}, was ever connected {_wasEverConnected}, connection status {_connectionStatus}");
-            return false;
+                _logger.Metric("MessageBacklog", _messagesToSend.Count);
+
+                // If not connected, skip the work below this round
+                if (!_isConnected)
+                {
+                    _logger.Trace($"Waiting for connection before batching telemetry", TraceSeverity.Warning);
+                    continue;
+                }
+
+                // Make a batch of messages to send, unless we're retrying a previous batch
+                if (!_pendingMessages.Any()
+                    && _messagesToSend.Any())
+                {
+                    int batchSizeBytes = 0;
+
+                    while (_messagesToSend.TryPeek(out Message nextMessage))
+                    {
+                        int nextMessageSize = MessageHelpers.GetMessagePayloadSize(nextMessage);
+                        if (batchSizeBytes + nextMessageSize > MessageHelpers.MaxMessagePayloadBytes)
+                        {
+                            break;
+                        }
+
+                        batchSizeBytes += nextMessageSize;
+                        _messagesToSend.TryDequeue(out Message thisMessage);
+                        _pendingMessages.Add(thisMessage);
+                    }
+
+                    _logger.Metric("MessageBacklog", _messagesToSend.Count);
+                    _logger.Metric("BatchSizeBytes", batchSizeBytes);
+                }
+
+                // Send any messages prepped to send
+                if (_pendingMessages.Any())
+                {
+                    _logger.Metric("PendingMessages", _pendingMessages.Count);
+
+                    try
+                    {
+                        await _deviceClient.SendEventBatchAsync(_pendingMessages).ConfigureAwait(false);
+
+                        _totalMessagesSent += _pendingMessages.Count;
+                        _logger.Metric("TotalMessagesSent", _totalMessagesSent);
+
+                        foreach (var message in _pendingMessages)
+                        {
+                            message.Dispose();
+                        }
+                        _pendingMessages.Clear();
+                    }
+                    catch (IotHubException ex) when (ex.IsTransient)
+                    {
+                        _logger.Trace($"Caught transient exception; will retry: {ex}", TraceSeverity.Warning);
+                    }
+                    catch (Exception ex) when (ExceptionHelper.IsNetworkExceptionChain(ex))
+                    {
+                        _logger.Trace($"A network-related exception was caught; will retry: {ex}", TraceSeverity.Warning);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Trace($"Unknown error batching telemetry: {ex}", TraceSeverity.Critical);
+                    }
+
+                }
+
+                _logger.Metric("PendingMessages", _pendingMessages.Count);
+            }
         }
 
-        public async Task SendTelemetryAsync(
-            object telemetryObject,
-            IDictionary<string, string> extraProperties,
-            CancellationToken cancellationToken)
+        public void AddTelemetry(
+            TelemetryBase telemetryObject,
+            IDictionary<string, string> extraProperties = null)
         {
             Debug.Assert(_deviceClient != null);
             Debug.Assert(telemetryObject != null);
@@ -90,6 +172,7 @@ namespace Microsoft.Azure.Iot.Thief.Device
             {
                 ContentEncoding = _contentEncoding,
                 ContentType = _contentType,
+                MessageId = Guid.NewGuid().ToString(),
             };
 
             foreach (var prop in IotProperties)
@@ -108,8 +191,8 @@ namespace Microsoft.Azure.Iot.Thief.Device
                 }
             }
 
-            await _deviceClient.SendEventAsync(iotMessage, cancellationToken).ConfigureAwait(false);
-            _logger.Trace($"Sent message [{message}]");
+            // Worker feeding off this queue will dispose the messages when they are sent
+            _messagesToSend.Enqueue(iotMessage);
         }
 
         public async Task SetPropertiesAsync(object properties, CancellationToken cancellationToken)
@@ -127,12 +210,64 @@ namespace Microsoft.Azure.Iot.Thief.Device
                 .ConfigureAwait(false);
         }
 
+        public void Dispose()
+        {
+            _logger.Trace("Disposing");
+
+            if (_lifetimeControl != null)
+            {
+                _lifetimeControl.Dispose();
+                _lifetimeControl = null;
+            }
+
+            ResetClient(true);
+
+            _logger.Trace($"IotHub instance disposed");
+
+        }
+
+        private bool ResetClient(bool force = false)
+        {
+            if (_deviceClient != null
+                && _wasEverConnected
+                && (force || _connectionStatus == ConnectionStatus.Disconnected))
+            {
+                _deviceClient?.Dispose();
+                _deviceClient = null;
+                _wasEverConnected = false;
+                _logger.Trace($"IotHub reset");
+                return true;
+            }
+
+            _logger.Trace($"IotHub not reset: device client instance {_deviceClient}, was ever connected {_wasEverConnected}, connection status {_connectionStatus}");
+            return false;
+        }
+
         private void ConnectionStatusChangesHandler(ConnectionStatus status, ConnectionStatusChangeReason reason)
         {
-            _logger.Trace($"Connection status changed: status=[{status}], reason=[{reason}]", TraceSeverity.Information);
+            _logger.Trace($"Connection status changed ({++_connectionStatusChangeCount}): status=[{status}], reason=[{reason}]", TraceSeverity.Information);
 
             _connectionStatus = status;
             _isConnected = status == ConnectionStatus.Connected;
+
+            if (_isConnected && _disconnectedTimer.IsRunning)
+            {
+                _disconnectedTimer.Stop();
+                _logger.Metric(
+                    "DisconnectedDurationMinutes",
+                    _disconnectedTimer.Elapsed.TotalMinutes,
+                    new Dictionary<string, string>
+                    {
+                        { "DisconnectedStatus", _disconnectedStatus.ToString() },
+                        { "DisconnectedReason", _disconnectedReason.ToString() },
+                    });
+            }
+            else if (!_isConnected && !_disconnectedTimer.IsRunning)
+            {
+                _disconnectedTimer.Restart();
+                _disconnectedStatus = status;
+                _disconnectedReason = reason;
+            }
 
             switch (status)
             {
@@ -186,20 +321,6 @@ namespace Microsoft.Azure.Iot.Thief.Device
                     _logger.Trace("This combination of ConnectionStatus and ConnectionStatusChangeReason is not expected", TraceSeverity.Critical);
                     break;
             }
-        }
-
-        public void Dispose()
-        {
-            if (_lifetimeControl != null)
-            {
-                _lifetimeControl.Dispose();
-                _lifetimeControl = null;
-            }
-
-            Cleanup(true);
-
-            _logger.Trace($"IotHub instance disposed");
-
         }
     }
 }

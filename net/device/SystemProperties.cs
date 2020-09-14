@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 
 namespace Microsoft.Azure.Iot.Thief.Device
 {
-    class SystemHealthProperties
+    class SystemProperties
     {
         [JsonPropertyName("systemArchitecture")]
         public string SystemArchitecture { get; set; } = RuntimeInformation.OSArchitecture.ToString();

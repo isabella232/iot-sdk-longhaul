@@ -12,9 +12,9 @@ namespace Microsoft.Azure.Iot.Thief.Device
         /// <summary>
         /// Sends the specified telemetry object as a message.
         /// </summary>
-        /// <param name="telemetryObject">An object to be converted to an application/json payload to send.</param>
-        /// <param name="cancellationToken">A cancellation token.</param>
-        Task SendTelemetryAsync(object telemetryObject, IDictionary<string, string> extraProperties = null, CancellationToken cancellationToken = default);
+        /// <param name="telemetry">An object to be converted to an application/json payload to send.</param>
+        /// <param name="extraProperties">Additional properties to send with the telemetry message.</param>
+        void AddTelemetry(TelemetryBase telemetry, IDictionary<string, string> extraProperties = null);
 
         /// <summary>
         /// Sets the specified properties on the device twin.
