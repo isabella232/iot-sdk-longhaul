@@ -1,0 +1,12 @@
+ARG BASE
+FROM ${BASE}
+
+ARG AZURE_IOT_SERVICE_VERSION
+RUN pip install azure-iot-hub==${AZURE_IOT_SERVICE_VERSION}
+
+COPY device/* /device/
+COPY containers/fetch-service-secrets.sh /
+COPY containers/run-service.sh /
+
+CMD ["/bin/bash", "/run-service.sh"]
+

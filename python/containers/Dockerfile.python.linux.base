@@ -8,11 +8,13 @@ RUN apt-get update \
         jq \
     && rm -rf /var/lib/apt/lists/*
 
-COPY device/requirements.txt /requirements.txt
+COPY device/requirements.txt /requirements-device.txt
+COPY service/requirements.txt /requirements-service.txt
 
 RUN apt-get update \
     && apt-get -y install --no-install-recommends gcc python-dev \
-    && pip install -r /requirements.txt \
+    && pip install -r /requirements-service.txt \
+    && pip install -r /requirements-device.txt \
     && apt-get -y remove gcc python-dev \
     && apt-get -y autoremove \
     && rm -rf /var/lib/apt/lists/* \

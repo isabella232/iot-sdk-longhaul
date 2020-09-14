@@ -1,7 +1,8 @@
 ARG BASE
 FROM ${BASE}
 
-RUN pip install azure-iot-device
+ARG AZURE_IOT_DEVICE_VERSION
+RUN pip install azure-iot-device==${AZURE_IOT_DEVICE_VERSION}
 
 COPY device/* /device/
 COPY containers/fetch-device-secrets.sh /
