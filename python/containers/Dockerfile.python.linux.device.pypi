@@ -4,9 +4,12 @@ FROM ${BASE}
 ARG AZURE_IOT_DEVICE_VERSION
 RUN pip install azure-iot-device==${AZURE_IOT_DEVICE_VERSION}
 
-COPY device/* /device/
+COPY containers/fetch-functions.sh /
 COPY containers/fetch-device-secrets.sh /
 COPY containers/run-device.sh /
+COPY device/* /device/
+COPY common/* /common/
+RUN pip install -e common
 
 CMD ["/bin/bash", "/run-device.sh"]
 

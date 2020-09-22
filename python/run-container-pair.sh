@@ -8,22 +8,24 @@ DEVICE_ID=${USER}-${DATETIME_NOW}
 SERVICE_CONTAINER_NAME=${DEVICE_ID}-service
 DEVICE_CONTAINER_NAME=${DEVICE_ID}-device
 
-echo "creating service client container"
+echo "creating device client container"
 az container create \
+    --no-wait \
     --resource-group ${THIEF_RUNS_RESOURCE_GROUP} \
-    --name ${SERVICE_CONTAINER_NAME} \
-    --image ${THIEF_CONTAINER_REGISTRY_HOST}/${SERVICE_IMAGE} \
+    --name ${DEVICE_CONTAINER_NAME} \
+    --image ${THIEF_CONTAINER_REGISTRY_HOST}/${DEVICE_IMAGE} \
     --environment-variables "THIEF_DEVICE_ID=${DEVICE_ID}" \
     --registry-username ${THIEF_CONTAINER_REGISTRY_USER} \
     --registry-password ${THIEF_CONTAINER_REGISTRY_PASSWORD} \
     --restart-policy Never \
     --assign-identity ${THIEF_USER_RESOURCE_ID} 
 
-echo "creating device client container"
+echo "creating service client container"
 az container create \
+    --no-wait \
     --resource-group ${THIEF_RUNS_RESOURCE_GROUP} \
-    --name ${DEVICE_CONTAINER_NAME} \
-    --image ${THIEF_CONTAINER_REGISTRY_HOST}/${DEVICE_IMAGE} \
+    --name ${SERVICE_CONTAINER_NAME} \
+    --image ${THIEF_CONTAINER_REGISTRY_HOST}/${SERVICE_IMAGE} \
     --environment-variables "THIEF_DEVICE_ID=${DEVICE_ID}" \
     --registry-username ${THIEF_CONTAINER_REGISTRY_USER} \
     --registry-password ${THIEF_CONTAINER_REGISTRY_PASSWORD} \

@@ -1,5 +1,4 @@
 inflection
 opencensus-ext-azure
-azure-iot-device
-azure-iot-hub
+azure-iot-device >= 2.1.4
 

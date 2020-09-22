@@ -1,2 +1,2 @@
 source /fetch-service-secrets.sh
-python /device/service.py
+python -u /service/service.py

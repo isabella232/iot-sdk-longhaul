@@ -1,21 +1,9 @@
-THIEF_KEYVAULT_NAME="thief-kv"
+# Copyright (c) Microsoft. All rights reserved.
+# Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
-echo "Getting token"
-while [ "$token" == "" ]; do 
-    token=$(curl --silent 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -H Metadata:true | jq -r ".access_token")
-    [ $? -eq 0 ] || sleep 2
-done
+script_dir=$(cd "$(dirname "$0")" && pwd)
 
-function get-secret {
-    bash_name=$1
-    kv_name=$2
-    echo "Getting ${bash_name}"
-    value=$(curl --silent "https://${THIEF_KEYVAULT_NAME}.vault.azure.net/secrets/${kv_name}/?api-version=2016-10-01" -H "Authorization: Bearer $token")
-    echo $value
-    value=$(echo $value | jq -r '.value')
-    echo $value
-    export ${bash_name}=${value}
-}
+source ${script_dir}/fetch-functions.sh
 
 echo Fetching secrets
 get-secret THIEF_DEVICE_PROVISIONING_HOST THIEF-DEVICE-PROVISIONING-HOST
