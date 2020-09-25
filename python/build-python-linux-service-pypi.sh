@@ -3,7 +3,7 @@
 # full license information.
 set -e
 
-AZURE_IOT_SERVICE_VERSION=2.2.1
+AZURE_IOT_SERVICE_VERSION=2.2.2
 
 function do_build {
     PYTHON_VERSION=$1
