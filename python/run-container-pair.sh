@@ -3,8 +3,8 @@
 # full license information.
 set -e
 
-DEVICE_IMAGE=py36-linux-device-pypi-2.1.4
-SERVICE_IMAGE=py38-linux-service-pypi-2.2.1
+DEVICE_IMAGE=py36-linux-device-pypi-2.2.0
+SERVICE_IMAGE=py38-linux-service-pypi-2.2.2
 DATETIME_NOW=$(date "+%Y-%m-%d-%H-%M-%S")
 
 DEVICE_ID=${USER}-${DATETIME_NOW}
