@@ -4,6 +4,7 @@
 import logging
 import os
 import time
+import uuid
 import json
 import datetime
 import threading
@@ -12,7 +13,6 @@ import dps
 import longhaul
 import reaper
 import sys
-import uuid
 from azure.iot.device import Message
 from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
 from thief_utilities import get_random_string
@@ -212,9 +212,7 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             msg = Message(json.dumps(props))
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
-
             logger.info("Sending thief telementry: {}".format(msg.data))
-
             self.client.send_message(msg)
 
             self.done.wait(self.config.thief_telemetry_send_interval)
@@ -252,7 +250,6 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                 thief = obj.get("thief")
                 cmd = thief.get("cmd") if thief else None
                 if cmd == "heartbeat":
-                    # BKTODO: add this to span?
                     logger.info(
                         "heartbeat received.  heartbeatId={}".format(thief.get("heartbeatId"))
                     )
@@ -306,14 +303,14 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         also for making sure that heartbeat messages are received often enough
         """
         while not self.done.isSet():
+            logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
             msg = Message(
                 json.dumps({"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}})
             )
+            self.next_heartbeat_id += 1
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
             self.client.send_message(msg)
-
-            self.next_heartbeat_id += 1
             self.metrics.heartbeats_sent.increment()
 
             seconds_since_last_heartbeat = time.time() - self.last_heartbeat

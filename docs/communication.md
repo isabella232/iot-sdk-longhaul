@@ -8,7 +8,7 @@ This document describes communication between Thief device and service apps and 
 ## Process communication (C2D and D2C)
 In many cases, the C2D and D2C payloads have the same format for the same functionality.  For example, the heartbeat sent by the service app has an identical JSON schema to the heartbeat that is sent by the device app.
 
-In some cases, there is a request/respones paradigm.  For example, a device might send pingback D2C message, which is used to ask the service to respond, and the service responds with a pingbackResponse C2D mesage.
+In some cases, there is a request/respones paradigm.  For example, a device might send pingback D2C message, which is used to ask the service to respond, and the service responds with a pingbackResponse C2D message.
 
 In other cases, the communication is "fire-and-forget" such as heartbeat messages.  When the device sends a heartbeat message, it does not expect a response from the service app.
 
@@ -41,7 +41,7 @@ example:
 ```json
 "thief": {
     "cmd": "pinback",
-        "pingbackId": "27cee6a8-6ff6-484c-ba2e-6b53335e5fea"
+    "pingbackId": "27cee6a8-6ff6-484c-ba2e-6b53335e5fea"
 }
 ```
 
