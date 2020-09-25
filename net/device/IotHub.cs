@@ -50,6 +50,9 @@ namespace Microsoft.Azure.Iot.Thief.Device
             _deviceClient = null;
         }
 
+        /// <summary>
+        /// Initializes the connection to IoT Hub.
+        /// </summary>
         public async Task InitializeAsync()
         {
             await _lifetimeControl.WaitAsync().ConfigureAwait(false);
@@ -70,6 +73,10 @@ namespace Microsoft.Azure.Iot.Thief.Device
             }
         }
 
+        /// <summary>
+        /// Runs a background
+        /// </summary>
+        /// <param name="ct">The cancellation token</param>
         public async Task RunAsync(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
@@ -151,7 +158,6 @@ namespace Microsoft.Azure.Iot.Thief.Device
                     {
                         _logger.Trace($"Unknown error batching telemetry: {ex}", TraceSeverity.Critical);
                     }
-
                 }
 
                 _logger.Metric("PendingMessages", _pendingMessages.Count);
@@ -165,6 +171,11 @@ namespace Microsoft.Azure.Iot.Thief.Device
             Debug.Assert(_deviceClient != null);
             Debug.Assert(telemetryObject != null);
 
+            // Save off the event time, or use "now" if not specified
+            var creationTimeUtc = telemetryObject.EventDateTimeUtc ?? DateTime.UtcNow;
+            // Remove it so it does not get serialized in the message
+            telemetryObject.EventDateTimeUtc = null;
+
             string message = JsonSerializer.Serialize(telemetryObject, _jsonSerializerOptions);
             Debug.Assert(!string.IsNullOrWhiteSpace(message));
 
@@ -173,6 +184,8 @@ namespace Microsoft.Azure.Iot.Thief.Device
                 ContentEncoding = _contentEncoding,
                 ContentType = _contentType,
                 MessageId = Guid.NewGuid().ToString(),
+                // Add the event time to the system property
+                CreationTimeUtc = creationTimeUtc,
             };
 
             foreach (var prop in IotProperties)
@@ -186,8 +199,11 @@ namespace Microsoft.Azure.Iot.Thief.Device
                 {
                     // Use TryAdd to ensure the attempt does not fail with an exception
                     // in the event that this key already exists in this dictionary,
-                    // in which case it'll silently fail.
-                    iotMessage.Properties.TryAdd(prop.Key, prop.Value);
+                    // in which case it'll log an error.
+                    if (!iotMessage.Properties.TryAdd(prop.Key, prop.Value))
+                    {
+                        _logger.Trace($"Could not add telemetry property {prop.Key} due to conflict.", TraceSeverity.Error);
+                    }
                 }
             }
 

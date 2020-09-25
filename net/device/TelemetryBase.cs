@@ -9,6 +9,6 @@ namespace Microsoft.Azure.Iot.Thief.Device
         /// The date/time the event occurred, in UTC.
         /// </summary>
         [JsonPropertyName("eventDateTimeUtc")]
-        public DateTimeOffset EventDateTimeUtc { get; set; } = DateTimeOffset.UtcNow;
+        public DateTime? EventDateTimeUtc { get; set; } = DateTime.UtcNow;
     }
 }
