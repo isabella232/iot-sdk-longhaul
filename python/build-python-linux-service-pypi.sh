@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft. All rights reserved.
+# Licensed under the MIT license. See LICENSE file in the project root for
+# full license information.
 set -e
 
 AZURE_IOT_SERVICE_VERSION=2.2.1

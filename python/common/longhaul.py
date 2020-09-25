@@ -37,7 +37,7 @@ class OperationConfig(object):
 
     def __init__(self):
         self.operations_per_second = 0
-        self.timeout_interval_in_seconds = 0
+        self.timeout_interval = 0
         self.failures_allowed = 0
 
 
@@ -48,8 +48,15 @@ class RunMetrics(object):
 
     def __init__(self):
         self.run_start = None
-        self.run_end = None
+        self.run_time = None
         self.run_state = WAITING
+        self.exit_reason = None
+        self.heartbeats_sent = ThreadSafeCounter()
+        self.heartbeats_received = ThreadSafeCounter()
+        self.pingback_requests_sent = ThreadSafeCounter()
+        self.pingback_responses_received = ThreadSafeCounter()
+        self.pingback_requests_received = ThreadSafeCounter()
+        self.pingback_responses_sent = ThreadSafeCounter()
 
 
 class RunConfig(object):
@@ -58,9 +65,11 @@ class RunConfig(object):
     """
 
     def __init__(self):
-        self.max_run_duration_in_seconds = 0
+        self.max_run_duration = 0
         self.heartbeat_interval = 10
         self.heartbeat_failure_interval = 30
+        self.thief_telemetry_send_interval = 10
+        self.thief_property_update_interval = 10
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -85,4 +94,4 @@ class LonghaulMixin(object):
                 metrics.succeeded.increment()
                 metrics.total_succeeded.increment()
 
-        self.callback_on_future_exit(future, local_callback, config.timeout_interval_in_seconds)
+        self.callback_on_future_exit(future, local_callback, config.timeout_interval)

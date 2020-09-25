@@ -54,10 +54,15 @@ class ReaperMixin(object):
         """
 
         def local_callback(f):
-            logger.warning("Future {} is complete".format(name))
+            e = f.exception()
+            if e:
+                logger.error(
+                    "Future {} is complete because of exception {}".format(name, e), exc_info=e
+                )
+            else:
+                logger.warning("Future {} is complete with no exception".format(name))
             if not self.reaper_shutdown_event.isSet():
-                e = f.exception() or Exception("{} thread exited prematurely".format(name))
-                self.shutdown(e)
+                self.shutdown(e or Exception("{} thread exited prematurely".format(name)))
                 self.reaper_shutdown_event.set()
 
         future.add_done_callback(local_callback)

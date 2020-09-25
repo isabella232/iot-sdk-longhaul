@@ -1,6 +1,7 @@
-#!/bin/bash
+# !/bin/bash
 # Copyright (c) Microsoft. All rights reserved.
-# Licensed under the MIT license. See LICENSE file in the project root for full license information.
+# Licensed under the MIT license. See LICENSE file in the project root for
+# full license information.
 
 if [ "${BASH_SOURCE-}" = "$0" ]; then
     echo "You must source this script: \$ source $0" >&2

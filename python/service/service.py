@@ -9,8 +9,11 @@ import os
 import queue
 import threading
 import json
+import sys
+import datetime
 from concurrent.futures import ThreadPoolExecutor
 from azure.iot.hub import IoTHubRegistryManager
+from azure.iot.hub.models import Twin, TwinProperties
 from azure.eventhub import EventHubConsumerClient
 
 logger = logging.getLogger("thief.{}".format(__name__))
@@ -58,6 +61,7 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=128)
         self.done = threading.Event()
+        self.registry_manager_lock = threading.Lock()
         self.registry_manager = None
         self.eventhub_consumer_client = None
         self.metrics = ServiceRunMetrics()
@@ -66,8 +70,46 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         self.pingback_events_lock = threading.Lock()
         self.last_heartbeat = time.time()
         self.shutdown_event = threading.Event()
+        self.c2d_send_queue = queue.Queue()
+        self.next_heartbeat_id = 1000000
 
         self.start_reaper()
+
+    def get_props_from_metrics(self):
+        self.metrics.run_time = datetime.datetime.now() - self.metrics.run_start
+
+        props = {
+            "runStart": str(self.metrics.run_start),
+            "runTime": str(self.metrics.run_time),
+            "runState": str(self.metrics.run_state),
+            "exitReason": self.metrics.exit_reason,
+            "heartbeats": {
+                "sent": self.metrics.heartbeats_sent.get_count(),
+                "received": self.metrics.heartbeats_received.get_count(),
+            },
+            "pingbacks": {
+                "requestsSent": self.metrics.pingback_requests_sent.get_count(),
+                "responsesReceived": self.metrics.pingback_responses_received.get_count(),
+                "requestsReceived": self.metrics.pingback_requests_received.get_count(),
+                "responsesSent": self.metrics.pingback_responses_sent.get_count(),
+            },
+        }
+        return props
+
+    def update_initial_reported_properties(self):
+        """
+        Update reported properties at the start of a run
+        """
+        # TODO language and version bits
+
+        twin = Twin()
+        twin.properties = TwinProperties(
+            desired={"thief": {"service": self.get_props_from_metrics()}}
+        )
+
+        logger.info("Setting initial thief properties: {}".format(twin.properties))
+        with self.registry_manager_lock:
+            self.registry_manager.update_twin(device_id, twin, "*")
 
     def eventhub_dispatcher_thread(self):
         """
@@ -86,10 +128,15 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         def on_event(partition_context, event):
             if get_device_id_from_event(event) == device_id:
                 body = event.body_as_json()
-                if "thiefHeartbeat" in body:
-                    logger.info("heartbeat received")
+                thief = body.get("thief")
+                cmd = thief.get("cmd") if thief else None
+                if cmd == "heartbeat":
+                    logger.info(
+                        "heartbeat received.  heartbeatId={}".format(thief.get("heartbeatId"))
+                    )
                     self.last_heartbeat = time.time()
-                elif "thiefPingback" in body:
+                    self.metrics.heartbeats_received.increment()
+                elif cmd == "pingback":
                     with self.pingback_events_lock:
                         self.pingback_events.put(event)
 
@@ -101,6 +148,41 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                 on_partition_initialize=on_partition_initialize,
                 on_partition_close=on_partition_close,
             )
+
+    def c2d_sender_thread(self):
+        while not (self.done.isSet() and self.c2d_send_queue.empty()):
+            try:
+                (device_id, message, props) = self.c2d_send_queue.get(timeout=1)
+            except queue.Empty:
+                pass
+            else:
+                tries_left = 3
+                success = False
+                while tries_left and not success:
+                    tries_left -= 1
+                    try:
+                        with self.registry_manager_lock:
+                            self.registry_manager.send_c2d_message(device_id, message, props)
+                            success = True
+                    except Exception as e:
+                        if tries_left:
+                            logger.error(
+                                "send_c2d_messge raised {}.  Reconnecting and trying again.".format(
+                                    e
+                                ),
+                                exc_info=e,
+                            )
+                            with self.registry_manager_lock:
+                                del self.registry_manager
+                                self.registry_manager = IoTHubRegistryManager(
+                                    iothub_connection_string
+                                )
+                        else:
+                            logger.error(
+                                "send_c2d_messge raised {}.  Final error. Raising.".format(e),
+                                exc_info=e,
+                            )
+                            raise
 
     def pingback_thread(self):
         """
@@ -114,18 +196,25 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                     event = self.pingback_events.get_nowait()
                 except queue.Empty:
                     break
-                message_ids.append(event.body_as_json()["messageId"])
+                message_ids.append(event.body_as_json()["thief"]["messageId"])
+                self.metrics.pingback_requests_received.increment()
 
             if len(message_ids):
                 print("pingback for {}".format(message_ids))
 
-                message = json.dumps({"thiefPingbackResponse": True, "messageIds": message_ids})
-
-                self.registry_manager.send_c2d_message(
-                    device_id,
-                    message,
-                    {"contentType": "application/json", "contentEncoding": "utf-8"},
+                message = json.dumps(
+                    {"thief": {"cmd": "pingbackResponse", "messageIds": message_ids}}
                 )
+
+                self.c2d_send_queue.put(
+                    (
+                        device_id,
+                        message,
+                        {"contentType": "application/json", "contentEncoding": "utf-8"},
+                    )
+                )
+
+                self.metrics.pingback_responses_sent.increment()
 
             time.sleep(1)
 
@@ -135,12 +224,20 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         also for making sure that heartbeat messages are received often enough
         """
         while not self.done.isSet():
-            message = json.dumps({"thiefHeartbeat": True})
-
-            logger.info("sending heartbeat")
-            self.registry_manager.send_c2d_message(
-                device_id, message, {"contentType": "application/json", "contentEncoding": "utf-8"},
+            logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
+            message = json.dumps(
+                {"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}}
             )
+            self.next_heartbeat_id += 1
+
+            self.c2d_send_queue.put(
+                (
+                    device_id,
+                    message,
+                    {"contentType": "application/json", "contentEncoding": "utf-8"},
+                )
+            )
+            self.metrics.heartbeats_sent.increment()
 
             seconds_since_last_heartbeat = time.time() - self.last_heartbeat
             if seconds_since_last_heartbeat > self.config.heartbeat_failure_interval:
@@ -150,15 +247,42 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
 
             time.sleep(self.config.heartbeat_interval)
 
+    def update_thief_properties_thread(self):
+        """
+        Thread which occasionally sends reported properties with information about how the
+        test is progressing
+        """
+        done = False
+
+        while not done:
+            # setting this at the begining and checking at the end guarantees one last update
+            # before the thread dies
+            if self.done.isSet():
+                done = True
+
+            twin = Twin()
+            twin.properties = TwinProperties(
+                desired={"thief": {"service": self.get_props_from_metrics()}}
+            )
+
+            logger.info("Updating thief properties: {}".format(twin.properties))
+            with self.registry_manager_lock:
+                self.registry_manager.update_twin(device_id, twin, "*")
+
+            self.done.wait(self.config.thief_property_update_interval)
+
     def wait_for_device_creation(self):
-        # Make sure our device exists before we continue.  Since the device app and this
-        # app are both starting up around the same time, it's possible that the device app
-        # hasn't used DPS to crate the device yet.  Give up after 60 seconds
+        """
+        Make sure our device exists before we continue.  Since the device app and this
+        app are both starting up around the same time, it's possible that the device app
+        hasn't used DPS to crate the device yet.  Give up after 60 seconds
+        """
         start_time = time.time()
         device = None
         while not device and (time.time() - start_time) < 60:
             try:
-                device = self.registry_manager.get_device(device_id)
+                with self.registry_manager_lock:
+                    device = self.registry_manager.get_device(device_id)
             except Exception as e:
                 logger.info("get_device returned: {}".format(e))
                 try:
@@ -189,18 +313,21 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                 logger.error("shutdown: triggering error shutdown", exc_info=error)
             else:
                 self.metrics.run_state = longhaul.COMPLETE
-                logger.info("shutdown: trigering clean shutdown")
+                logger.info("shutdown: triggering clean shutdown")
+            self.metrics.exit_reason = str(error or "Clean shutdown")
             self.shutdown_event.set()
 
     def main(self):
         set_config(self.config)
 
-        self.metrics.run_start = time.time()
+        self.metrics.run_start = datetime.datetime.now()
         self.metrics.run_state = longhaul.RUNNING
 
-        self.registry_manager = IoTHubRegistryManager(iothub_connection_string)
+        with self.registry_manager_lock:
+            self.registry_manager = IoTHubRegistryManager(iothub_connection_string)
 
         self.wait_for_device_creation()
+        self.update_initial_reported_properties()
 
         self.eventhub_consumer_client = EventHubConsumerClient.from_connection_string(
             eventhub_connection_string, consumer_group=eventhub_consumer_group
@@ -208,17 +335,24 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
 
         # spin up threads that are required for operation
         self.shutdown_on_future_exit(
-            self.executor.submit(self.eventhub_dispatcher_thread), name="eventhub_dispatcher"
+            self.executor.submit(self.eventhub_dispatcher_thread), name="eventhub_dispatcher_thread"
         )
         self.shutdown_on_future_exit(
-            self.executor.submit(self.pingback_thread), name="pingback thread"
+            self.executor.submit(self.c2d_sender_thread), name="c2d_sender_thread"
         )
         self.shutdown_on_future_exit(
-            self.executor.submit(self.heartbeat_thread), name="heartbeat thread"
+            self.executor.submit(self.pingback_thread), name="pingback_thread"
+        )
+        self.shutdown_on_future_exit(
+            self.executor.submit(self.heartbeat_thread), name="heartbeat_thread"
+        )
+        self.shutdown_on_future_exit(
+            self.executor.submit(self.update_thief_properties_thread),
+            name="update_thief_properties_thread",
         )
 
         # Live my life the way I want to until it's time for me to die.
-        self.shutdown_event.wait(timeout=self.config.max_run_duration_in_seconds or None)
+        self.shutdown_event.wait(timeout=self.config.max_run_duration or None)
 
         logger.info("Run is complete.  Cleaning up.")
 
@@ -237,6 +371,9 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         self.executor.shutdown()
 
         logger.info("Done disconnecting.  Exiting")
+
+        if self.metrics.run_state == longhaul.FAILED:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

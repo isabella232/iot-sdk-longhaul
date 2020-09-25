@@ -13,6 +13,7 @@ from measurement import MeasureLatency
 import dps
 import longhaul
 import reaper
+import sys
 from azure.iot.device import Message
 
 logger = logging.getLogger("thief.{}".format(__name__))
@@ -45,7 +46,6 @@ class DeviceRunConfig(longhaul.RunConfig):
 
     def __init__(self):
         super(DeviceRunConfig, self).__init__()
-        self.system_telemetry_send_interval_in_seconds = 0
         self.d2c = longhaul.OperationConfig()
 
 
@@ -53,7 +53,7 @@ def make_new_d2c_payload(message_id):
     """
     Helper function to create a unique payload which can be sent up as d2c message
     """
-    msg = {"messageId": message_id, "thiefPingback": True}
+    msg = {"thief": {"cmd": "pingback", "messageId": message_id}}
     return Message(json.dumps(msg))
 
 
@@ -62,10 +62,9 @@ def set_config(config):
     Helper function which sets our configuration.  Right now, this is hardcoded.
     Later, this will come from desired properties.
     """
-    config.system_telemetry_send_interval_in_seconds = 10
-    config.max_run_duration_in_seconds = 0
+    config.max_run_duration = 0
     config.d2c.operations_per_second = 3
-    config.d2c.timeout_interval_in_seconds = 60
+    config.d2c.timeout_interval = 60
     config.d2c.failures_allowed = 0
 
 
@@ -85,19 +84,41 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         self.d2c_unconfirmed = set()
         self.last_heartbeat = time.time()
         self.shutdown_event = threading.Event()
+        self.next_heartbeat_id = 0
 
         self.start_reaper()
 
-    def update_initial_properties(self):
+    def get_props_from_metrics(self):
+        self.metrics.run_time = datetime.datetime.now() - self.metrics.run_start
+
+        props = {
+            "runStart": str(self.metrics.run_start),
+            "runTime": str(self.metrics.run_time),
+            "runState": str(self.metrics.run_state),
+            "exitReason": self.metrics.exit_reason,
+            "heartbeats": {
+                "sent": self.metrics.heartbeats_sent.get_count(),
+                "received": self.metrics.heartbeats_received.get_count(),
+            },
+            "pingbacks": {
+                "requestsSent": self.metrics.pingback_requests_sent.get_count(),
+                "responsesReceived": self.metrics.pingback_responses_received.get_count(),
+                "requestsReceived": self.metrics.pingback_requests_received.get_count(),
+                "responsesSent": self.metrics.pingback_responses_sent.get_count(),
+            },
+            "d2c": {
+                "totalSuccessCount": self.metrics.d2c.total_succeeded.get_count(),
+                "totalFailureCount": self.metrics.d2c.total_failed.get_count(),
+            },
+        }
+        return props
+
+    def update_initial_reported_properties(self):
         """
         Update reported properties at the start of a run
         """
-        # toto: update these values
-        props = {
-            "runStart": str(datetime.datetime.now()),
-            "runState": longhaul.RUNNING,
-            "sdkLanguage": "python",
-        }
+        # TODO: language and version bits
+        props = {"thief": {"device": self.get_props_from_metrics()}}
 
         logger.info("Setting initial thief properties: {}".format(props))
         self.client.patch_twin_reported_properties(props)
@@ -122,6 +143,7 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
 
             finally:
                 self.metrics.d2c.inflight.decrement()
+            self.metrics.pingback_requests_sent.increment()
 
         while not self.done.isSet():
             # submit a thread for the new event
@@ -146,10 +168,13 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                 done = True
 
             props = {
-                "averageD2cRoundtripLatencyToGatewayInSeconds": self.metrics.d2c.latency.extract_average(),
-                "d2cInFlightCount": self.metrics.d2c.inflight.get_count(),
-                "d2cSuccessCount": self.metrics.d2c.succeeded.extract_count(),
-                "d2cFailureCount": self.metrics.d2c.failed.extract_count(),
+                "thief": {
+                    "cmd": "telemetry",
+                    "averageD2cRoundtripLatencyToGatewayInSeconds": self.metrics.d2c.latency.extract_average(),
+                    "d2cInFlightCount": self.metrics.d2c.inflight.get_count(),
+                    "d2cSuccessCount": self.metrics.d2c.succeeded.extract_count(),
+                    "d2cFailureCount": self.metrics.d2c.failed.extract_count(),
+                }
             }
 
             msg = Message(json.dumps(props))
@@ -158,7 +183,7 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             logger.info("Sending thief telementry: {}".format(msg.data))
             self.client.send_message(msg)
 
-            self.done.wait(self.config.system_telemetry_send_interval_in_seconds)
+            self.done.wait(self.config.thief_telemetry_send_interval)
 
     def update_thief_properties_thread(self):
         """
@@ -173,18 +198,12 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             if self.done.isSet():
                 done = True
 
-            props = {
-                "d2cTotalSuccessCount": self.metrics.d2c.total_succeeded.get_count(),
-                "d2cTotalFailureCount": self.metrics.d2c.total_failed.get_count(),
-                "runState": self.metrics.run_state,
-            }
-            if self.metrics.run_end:
-                props["runEnd"] = self.metrics.run_end
+            props = {"thief": {"device": self.get_props_from_metrics()}}
 
             logger.info("updating thief props: {}".format(props))
             self.client.patch_twin_reported_properties(props)
 
-            self.done.wait(self.config.system_telemetry_send_interval_in_seconds)
+            self.done.wait(self.config.thief_property_update_interval)
 
     def dispatch_c2d_thread(self):
         """
@@ -196,11 +215,18 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
 
             if msg:
                 obj = json.loads(msg.data.decode())
-                if obj.get("thiefHeartbeat"):
-                    logger.info("heartbeat received")
+                thief = obj.get("thief")
+                cmd = thief.get("cmd") if thief else None
+                if cmd == "heartbeat":
+                    logger.info(
+                        "heartbeat received.  heartbeatId={}".format(thief.get("heartbeatId"))
+                    )
                     self.last_heartbeat = time.time()
-                elif obj.get("thiefPingbackResponse"):
-                    list = obj.get("messageIds")
+                    self.metrics.heartbeats_received.increment()
+                elif cmd == "pingbackResponse":
+                    self.metrics.pingback_responses_received.increment()
+                    # TODO: move to queue
+                    list = thief.get("messageIds")
                     if list:
                         with self.d2c_set_lock:
                             for message_id in list:
@@ -217,11 +243,15 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         also for making sure that heartbeat messages are received often enough
         """
         while not self.done.isSet():
-            msg = Message(json.dumps({"thiefHeartbeat": True}))
+            logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
+            msg = Message(
+                json.dumps({"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}})
+            )
+            self.next_heartbeat_id += 1
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
-            logger.info("sending heartbeat")
             self.client.send_message(msg)
+            self.metrics.heartbeats_sent.increment()
 
             seconds_since_last_heartbeat = time.time() - self.last_heartbeat
             if seconds_since_last_heartbeat > self.config.heartbeat_failure_interval:
@@ -245,12 +275,13 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             else:
                 self.metrics.run_state = longhaul.COMPLETE
                 logger.info("shutdown: trigering clean shutdown")
+            self.metrics.exit_reason = str(error or "Clean shutdown")
             self.shutdown_event.set()
 
     def main(self):
         set_config(self.config)
 
-        self.metrics.run_start = time.time()
+        self.metrics.run_start = datetime.datetime.now()
         self.metrics.run_state = longhaul.RUNNING
 
         # Create our client and push initial properties
@@ -260,31 +291,31 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             id_scope=id_scope,
             group_symmetric_key=group_symmetric_key,
         )
-        self.update_initial_properties()
+        self.update_initial_reported_properties()
 
         # spin up threads that are required for operation
         self.shutdown_on_future_exit(
-            future=self.executor.submit(self.heartbeat_thread), name="heartbeat"
+            future=self.executor.submit(self.heartbeat_thread), name="heartbeat_thread"
         )
         self.shutdown_on_future_exit(
-            future=self.executor.submit(self.dispatch_c2d_thread), name="c2d_dispatch"
+            future=self.executor.submit(self.dispatch_c2d_thread), name="c2d_dispatch_thread"
         )
         self.shutdown_on_future_exit(
             future=self.executor.submit(self.send_thief_telemetry_thread),
-            name="send_thief_telemetry",
+            name="send_thief_telemetry_thread",
         )
         self.shutdown_on_future_exit(
             future=self.executor.submit(self.update_thief_properties_thread),
-            name="update_thief_properties",
+            name="update_thief_properties_thread",
         )
 
         # Spin up worker threads for each thing we're testing.
         self.shutdown_on_future_exit(
-            future=self.executor.submit(self.test_d2c_thread), name="test_d2c"
+            future=self.executor.submit(self.test_d2c_thread), name="test_d2c_thead"
         )
 
         # Live my life the way I want to until it's time for me to die.
-        self.shutdown_event.wait(timeout=self.config.max_run_duration_in_seconds or None)
+        self.shutdown_event.wait(timeout=self.config.max_run_duration or None)
 
         logger.info("Run is complete.  Cleaning up.")
 
@@ -308,6 +339,9 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         self.client.disconnect()
 
         logger.info("Done disconnecting.  Exiting")
+
+        if self.metrics.run_state == longhaul.FAILED:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

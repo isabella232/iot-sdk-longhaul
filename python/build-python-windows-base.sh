@@ -1,5 +1,7 @@
+# Copyright (c) Microsoft. All rights reserved.
+# Licensed under the MIT license. See LICENSE file in the project root for
+# full license information.
 set -e
-
 
 function do_build {
     SHORT_VER=$1

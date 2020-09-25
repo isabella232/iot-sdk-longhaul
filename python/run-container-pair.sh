@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft. All rights reserved.
+# Licensed under the MIT license. See LICENSE file in the project root for
+# full license information.
 set -e
 
 DEVICE_IMAGE=py36-linux-device-pypi-2.1.4
