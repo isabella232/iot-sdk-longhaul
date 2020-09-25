@@ -4,19 +4,22 @@
 import logging
 import os
 import time
-import uuid
 import json
 import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from measurement import MeasureLatency
 import dps
 import longhaul
 import reaper
 import sys
+import uuid
 from azure.iot.device import Message
+from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
+from thief_utilities import get_random_string
+
 
 logger = logging.getLogger("thief.{}".format(__name__))
+event_logger = get_event_logger("device")
 
 logging.basicConfig(level=logging.WARNING)
 # logging.getLogger("paho").setLevel(level=logging.DEBUG)
@@ -27,6 +30,11 @@ provisioning_host = os.environ["THIEF_DEVICE_PROVISIONING_HOST"]
 id_scope = os.environ["THIEF_DEVICE_ID_SCOPE"]
 group_symmetric_key = os.environ["THIEF_DEVICE_GROUP_SYMMETRIC_KEY"]
 registration_id = os.environ["THIEF_DEVICE_ID"]
+
+log_to_azure_monitor("thief", "device")
+log_to_azure_monitor("azure")
+log_to_azure_monitor("paho")
+enable_tracing("device")
 
 
 class DeviceRunMetrics(longhaul.RunMetrics):
@@ -49,23 +57,16 @@ class DeviceRunConfig(longhaul.RunConfig):
         self.d2c = longhaul.OperationConfig()
 
 
-def make_new_d2c_payload(message_id):
-    """
-    Helper function to create a unique payload which can be sent up as d2c message
-    """
-    msg = {"thief": {"cmd": "pingback", "messageId": message_id}}
-    return Message(json.dumps(msg))
-
-
 def set_config(config):
     """
     Helper function which sets our configuration.  Right now, this is hardcoded.
     Later, this will come from desired properties.
     """
     config.max_run_duration = 0
-    config.d2c.operations_per_second = 3
+    config.d2c.operations_per_second = 5
     config.d2c.timeout_interval = 60
     config.d2c.failures_allowed = 0
+    config.d2c.buffer_size = 16 * 1024
 
 
 class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
@@ -76,17 +77,38 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=128)
         self.done = threading.Event()
+        self.shutdown_event = threading.Event()
         self.client = None
         self.metrics = DeviceRunMetrics()
         self.config = DeviceRunConfig()
-        self.d2c_set_lock = threading.Lock()
-        self.d2c_confirmed = set()
-        self.d2c_unconfirmed = set()
-        self.last_heartbeat = time.time()
-        self.shutdown_event = threading.Event()
+        # for pingbacks
+        self.pingback_list_lock = threading.Lock()
+        self.pingback_wait_list = {}
+        self.received_pingback_list = []
+        self.new_pingback_event = threading.Event()
+        # for heartbeats
         self.next_heartbeat_id = 0
+        self.last_heartbeat = time.time()
+        self.first_heartbeat_received = threading.Event()
 
         self.start_reaper()
+
+    def make_new_d2c_payload(self, pingback_id, tracing_carrier=None):
+        """
+        Helper function to create a unique payload which can be sent up as d2c message
+        """
+        msg = {
+            "thief": {
+                "cmd": "pingback",
+                "pingbackId": pingback_id,
+                "buffer": get_random_string(self.config.d2c.buffer_size),
+            }
+        }
+
+        if tracing_carrier:
+            msg["thief"]["tracingCarrier"] = tracing_carrier
+
+        return Message(json.dumps(msg))
 
     def get_props_from_metrics(self):
         self.metrics.run_time = datetime.datetime.now() - self.metrics.run_start
@@ -128,21 +150,32 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         Thread to continuously send d2c messages throughout the longhaul run
         """
 
+        # Don't start sending until we know that there's a service app on the other side.
+        while not (self.first_heartbeat_received.isSet() or self.done.isSet()):
+            self.first_heartbeat_received.wait(1)
+
         def send_single_d2c_message():
-            message_id = str(uuid.uuid4())
-            data = make_new_d2c_payload(message_id)
-            latency = MeasureLatency()
+            tracer = DependencyTracer("thiefSendTelemetryWithPingback")
+            pingback_id = str(uuid.uuid4())
+
+            data = self.make_new_d2c_payload(pingback_id, tracing_carrier=tracer.span_to_dict())
+
+            def on_pingback_received():
+                # TODO: if the pingback is never received, this span is never persisted.  We should record failures.
+                tracer.end_operation()
+                self.metrics.d2c.verified.add(1)
+
+            with self.pingback_list_lock:
+                self.pingback_wait_list[pingback_id] = on_pingback_received
 
             try:
                 self.metrics.d2c.inflight.increment()
-                with latency:
+                with tracer.span("thiefSendTelemetry"):
                     self.client.send_message(data)
-                self.metrics.d2c.latency.append(latency.get_latency())
-                with self.d2c_set_lock:
-                    self.d2c_unconfirmed.add(message_id)
 
             finally:
                 self.metrics.d2c.inflight.decrement()
+
             self.metrics.pingback_requests_sent.increment()
 
         while not self.done.isSet():
@@ -170,7 +203,6 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             props = {
                 "thief": {
                     "cmd": "telemetry",
-                    "averageD2cRoundtripLatencyToGatewayInSeconds": self.metrics.d2c.latency.extract_average(),
                     "d2cInFlightCount": self.metrics.d2c.inflight.get_count(),
                     "d2cSuccessCount": self.metrics.d2c.succeeded.extract_count(),
                     "d2cFailureCount": self.metrics.d2c.failed.extract_count(),
@@ -180,7 +212,9 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             msg = Message(json.dumps(props))
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
+
             logger.info("Sending thief telementry: {}".format(msg.data))
+
             self.client.send_message(msg)
 
             self.done.wait(self.config.thief_telemetry_send_interval)
@@ -218,24 +252,53 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                 thief = obj.get("thief")
                 cmd = thief.get("cmd") if thief else None
                 if cmd == "heartbeat":
+                    # BKTODO: add this to span?
                     logger.info(
                         "heartbeat received.  heartbeatId={}".format(thief.get("heartbeatId"))
                     )
                     self.last_heartbeat = time.time()
                     self.metrics.heartbeats_received.increment()
+                    if not self.first_heartbeat_received.isSet():
+                        self.first_heartbeat_received.set()
+
                 elif cmd == "pingbackResponse":
                     self.metrics.pingback_responses_received.increment()
-                    # TODO: move to queue
-                    list = thief.get("messageIds")
+                    list = thief.get("pingbackIds")
                     if list:
-                        with self.d2c_set_lock:
-                            for message_id in list:
-                                self.d2c_confirmed.add(message_id)
-                            remove = self.d2c_confirmed & self.d2c_unconfirmed
-                            print("received {} items.  Removed {}".format(len(list), len(remove)))
-                            self.metrics.d2c.verified.add(len(remove))
-                            self.d2c_confirmed -= remove
-                            self.d2c_unconfirmed -= remove
+                        with self.pingback_list_lock:
+                            for pingback_id in list:
+                                self.received_pingback_list.append(pingback_id)
+                        self.new_pingback_event.set()
+
+    def handle_pingback_thread(self):
+
+        while not self.done.isSet():
+            self.new_pingback_event.clear()
+            callbacks = []
+
+            with self.pingback_list_lock:
+                new_list = []
+                for pingback_id in self.received_pingback_list:
+                    if pingback_id in self.pingback_wait_list:
+                        callbacks.append(self.pingback_wait_list[pingback_id])
+                        del self.pingback_wait_list[pingback_id]
+                    else:
+                        new_list.append(pingback_id)
+                self.received_pingback_list = new_list
+                if len(callbacks) or len(self.pingback_wait_list):
+                    # TODO: add this as metric?
+                    print(
+                        "handle_pingback_thread: {} new pingbacks received, {} pingbacks still unknown, waiting for {} pingbacks".format(
+                            len(callbacks),
+                            len(self.received_pingback_list),
+                            len(self.pingback_wait_list),
+                        )
+                    )
+
+            for callback in callbacks:
+                callback()
+
+            self.new_pingback_event.wait(timeout=1)
 
     def heartbeat_thread(self):
         """
@@ -243,14 +306,14 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         also for making sure that heartbeat messages are received often enough
         """
         while not self.done.isSet():
-            logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
             msg = Message(
                 json.dumps({"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}})
             )
-            self.next_heartbeat_id += 1
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
             self.client.send_message(msg)
+
+            self.next_heartbeat_id += 1
             self.metrics.heartbeats_sent.increment()
 
             seconds_since_last_heartbeat = time.time() - self.last_heartbeat
@@ -307,6 +370,9 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         self.shutdown_on_future_exit(
             future=self.executor.submit(self.update_thief_properties_thread),
             name="update_thief_properties_thread",
+        )
+        self.shutdown_on_future_exit(
+            future=self.executor.submit(self.handle_pingback_thread), name="handle_pingback_thread"
         )
 
         # Spin up worker threads for each thing we're testing.

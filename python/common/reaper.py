@@ -56,7 +56,7 @@ class ReaperMixin(object):
         def local_callback(f):
             e = f.exception()
             if e:
-                logger.error(
+                logger.exception(
                     "Future {} is complete because of exception {}".format(name, e), exc_info=e
                 )
             else:

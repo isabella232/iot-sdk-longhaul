@@ -6,9 +6,9 @@ This document describes communication between Thief device and service apps and 
 
 
 ## Process communication (C2D and D2C)
-In many cases, the C2D and D2C payloads have the same format for the same functionality.  For example, the heartbeat sent by the service app has an identical JSON schema to the hartbeat that is sent by the device app.
+In many cases, the C2D and D2C payloads have the same format for the same functionality.  For example, the heartbeat sent by the service app has an identical JSON schema to the heartbeat that is sent by the device app.
 
-In some cases, there is a request/respones paradigm.  For example, a device might send pingback D2C message, which is used to ask the service to respond, and hte service responds with a pingbackResponse C2D mesage.
+In some cases, there is a request/respones paradigm.  For example, a device might send pingback D2C message, which is used to ask the service to respond, and the service responds with a pingbackResponse C2D mesage.
 
 In other cases, the communication is "fire-and-forget" such as heartbeat messages.  When the device sends a heartbeat message, it does not expect a response from the service app.
 
@@ -22,9 +22,9 @@ If an app doesn"t receive a hertbeat within some failure interval, it should exi
 example:
 ```json
 "thief": {
-  "cmd": "heartbeat",
-  "heartbeatId": 17118
-  }
+    "cmd": "heartbeat",
+        "heartbeatId": 17118
+}
 ```
 
 fields:
@@ -41,7 +41,7 @@ example:
 ```json
 "thief": {
     "cmd": "pinback",
-    "messageId": "27cee6a8-6ff6-484c-ba2e-6b53335e5fea"
+        "pingbackId": "27cee6a8-6ff6-484c-ba2e-6b53335e5fea"
 }
 ```
 
@@ -49,17 +49,17 @@ fields:
 | name              | type                  | value/meaning                                                     |
 |-------------------|-----------------------|-------------------------------------------------------------------|
 | cmd               | string                | `pingback`                                                        |
-| messageId         | string(guid)          | unique ID for the message being sent.                             |
+| pingbackId        | string                | unique ID for the message being sent.                             |
 
 ### pingbackResponse
 
-A pingbackResponse is used to indicate reception of one or more pingback messages.  The messageeIds are grouped into an array to limit the number of C2D messages that are sent.  A client will typically wait one second before sending a pingbackResponse and include all guids that were recevied within that second.  
+A pingbackResponse is used to indicate reception of one or more pingback messages.  The messageIds are grouped into an array to limit the number of C2D messages that are sent.  A client will typically wait one second before sending a pingbackResponse and include all guids that were recevied within that second.  
 
 example:
 ```json
 "thief": {
     "cmd": "pingbackResponse",
-    "messageIds": [
+    "pingbackIds": [
         "27cee6a8-6ff6-484c-ba2e-6b53335e5fea", 
         "cf434228-1790-42e1-a095-9ce7ce6b0883", 
         "aa2a5a76-13a6-4b10-a689-a37cb736eb3b"
@@ -71,7 +71,7 @@ fields:
 | name              | type                  | value/meaning                                                     |
 |-------------------|-----------------------|-------------------------------------------------------------------|
 | cmd               | string                | `pingbackResponse`                                                |
-| messageIds        | array(string(guid))   | array of pingback guids                                           |
+| pingbackIds       | array(string)         | array of pingback ids                                             |
 
 ## Common operation metrics
 
@@ -155,7 +155,7 @@ d2c fields:
 ## Desired Properties - operational metrics
 
 Desired properties are used to return operational metrics for the service app to the iothub.
-This is technically a mususe of the desired properties feature because these are not actually _desired_ values.
+This is technically a misuse of the desired properties feature because these are not actually _desired_ values.
 
 example:
 ```json

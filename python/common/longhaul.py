@@ -4,7 +4,7 @@
 import logging
 import six
 import abc
-from measurement import ThreadSafeCounter, ThreadSafeList
+from measurement import ThreadSafeCounter
 
 
 logger = logging.getLogger("thief.{}".format(__name__))
@@ -27,7 +27,6 @@ class OperationMetrics(object):
         self.verified = ThreadSafeCounter()
         self.total_succeeded = ThreadSafeCounter()
         self.total_failed = ThreadSafeCounter()
-        self.latency = ThreadSafeList()
 
 
 class OperationConfig(object):
@@ -39,6 +38,7 @@ class OperationConfig(object):
         self.operations_per_second = 0
         self.timeout_interval = 0
         self.failures_allowed = 0
+        self.buffer_size = 0
 
 
 class RunMetrics(object):

@@ -15,8 +15,10 @@ from concurrent.futures import ThreadPoolExecutor
 from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub.models import Twin, TwinProperties
 from azure.eventhub import EventHubConsumerClient
+from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
 
 logger = logging.getLogger("thief.{}".format(__name__))
+event_logger = get_event_logger("device")
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("thief").setLevel(level=logging.INFO)
@@ -25,6 +27,10 @@ iothub_connection_string = os.environ["THIEF_SERVICE_CONNECTION_STRING"]
 eventhub_connection_string = os.environ["THIEF_EVENTHUB_CONNECTION_STRING"]
 eventhub_consumer_group = os.environ["THIEF_EVENTHUB_CONSUMER_GROUP"]
 device_id = os.environ["THIEF_DEVICE_ID"]
+
+log_to_azure_monitor("thief", "service")
+log_to_azure_monitor("azure")
+enable_tracing("service")
 
 
 class ServiceRunMetrics(longhaul.RunMetrics):
@@ -64,14 +70,21 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         self.registry_manager_lock = threading.Lock()
         self.registry_manager = None
         self.eventhub_consumer_client = None
+        self.shutdown_event = threading.Event()
         self.metrics = ServiceRunMetrics()
         self.config = ServiceRunConfig()
+
+        # for any kind of c2d
+        self.c2d_send_queue = queue.Queue()
+
+        # for pingbacks
         self.pingback_events = queue.Queue()
         self.pingback_events_lock = threading.Lock()
+
+        # for heartbeats
         self.last_heartbeat = time.time()
-        self.shutdown_event = threading.Event()
-        self.c2d_send_queue = queue.Queue()
-        self.next_heartbeat_id = 1000000
+        self.next_heartbeat_id = 10000
+        self.first_heartbeat_received = threading.Event()
 
         self.start_reaper()
 
@@ -130,12 +143,16 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                 body = event.body_as_json()
                 thief = body.get("thief")
                 cmd = thief.get("cmd") if thief else None
+
                 if cmd == "heartbeat":
                     logger.info(
                         "heartbeat received.  heartbeatId={}".format(thief.get("heartbeatId"))
                     )
                     self.last_heartbeat = time.time()
                     self.metrics.heartbeats_received.increment()
+                    if not self.first_heartbeat_received.isSet():
+                        self.first_heartbeat_received.set()
+
                 elif cmd == "pingback":
                     with self.pingback_events_lock:
                         self.pingback_events.put(event)
@@ -189,21 +206,29 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         Thread which is responsible for returning pingback response message to the
         device client on the other side of the wall.
         """
+
         while not self.done.isSet():
-            message_ids = []
+            pingback_ids = []
             while True:
                 try:
                     event = self.pingback_events.get_nowait()
                 except queue.Empty:
                     break
-                message_ids.append(event.body_as_json()["thief"]["messageId"])
+                thief = event.body_as_json()["thief"]
+                pingback_ids.append(thief["pingbackId"])
+                if "tracingCarrier" in thief:
+                    with DependencyTracer(
+                        "thiefPingbackReceived", thief["tracingCarrier"]
+                    ) as tracer:
+                        event_logger.info("thiefPingbackReceived", extra=tracer.get_logging_tags())
+
                 self.metrics.pingback_requests_received.increment()
 
-            if len(message_ids):
-                print("pingback for {}".format(message_ids))
+            if len(pingback_ids):
+                logger.info("send pingback for {}".format(pingback_ids))
 
                 message = json.dumps(
-                    {"thief": {"cmd": "pingbackResponse", "messageIds": message_ids}}
+                    {"thief": {"cmd": "pingbackResponse", "pingbackIds": pingback_ids}}
                 )
 
                 self.c2d_send_queue.put(
@@ -223,12 +248,16 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         Thread which is responsible for sending heartbeat messages to the other side and
         also for making sure that heartbeat messages are received often enough
         """
+
+        # Don't start sending heartbeats until we receive our first heartbeat from
+        # the other side
+        while not (self.first_heartbeat_received.isSet() or self.done.isSet()):
+            self.first_heartbeat_received.wait(1)
+
         while not self.done.isSet():
-            logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
             message = json.dumps(
                 {"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}}
             )
-            self.next_heartbeat_id += 1
 
             self.c2d_send_queue.put(
                 (
@@ -237,6 +266,7 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                     {"contentType": "application/json", "contentEncoding": "utf-8"},
                 )
             )
+            self.next_heartbeat_id += 1
             self.metrics.heartbeats_sent.increment()
 
             seconds_since_last_heartbeat = time.time() - self.last_heartbeat
