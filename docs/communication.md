@@ -4,6 +4,22 @@ This document describes communication between Thief device and service apps and 
 * Reported properties are used for reporting operational metrics of the _device_ app
 * Desired properties are used for reporting operational metrics of the _service_ app
 
+## Startup procedure.
+
+Device:
+* Start sending heartbeat every 10 seconds.
+* If device does not receive heartbeat within 30 seconds, it exits with failure.
+* When device receives heartbeat from service, it begins normal operation.
+* heartbeat cadence (every 10 seconds) and failure interval (no heartbeat for 30 seconds) apply during normal operation
+
+Service:
+* Checks registry for existence of device.  If device is not in registry, sleep for 10 seconds and try again
+* If device is not in registry after 60 seconds, service exits with failure
+* When device exists, service waits until it hears a heartbeat from the device.
+* If service doesn't receive a haeartbeat within 30 seconds, it exits with failure.
+* When service receives device heartbeat, it sends heartbeat to device and begins normal operation.
+* heartbeat cadence (every 10 seconds) and failure interval (no heartbeat for 30 seconds) apply during normal operation
+
 
 ## Process communication (C2D and D2C)
 In many cases, the C2D and D2C payloads have the same format for the same functionality.  For example, the heartbeat sent by the service app has an identical JSON schema to the heartbeat that is sent by the device app.
