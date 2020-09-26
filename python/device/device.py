@@ -14,9 +14,14 @@ import longhaul
 import reaper
 import sys
 from azure.iot.device import Message
+from measurement import ThreadSafeCounter
 from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
-from thief_utilities import get_random_string
 
+
+WAITING = "waiting"
+RUNNING = "running"
+FAILED = "failed"
+COMPLETE = "complete"
 
 logger = logging.getLogger("thief.{}".format(__name__))
 event_logger = get_event_logger("device")
@@ -37,36 +42,46 @@ log_to_azure_monitor("paho")
 enable_tracing("device")
 
 
-class DeviceRunMetrics(longhaul.RunMetrics):
+class DeviceRunMetrics(object):
     """
     Object we use internally to keep track of how a the entire test is performing.
     """
 
     def __init__(self):
-        super(DeviceRunMetrics, self).__init__()
-        self.d2c = longhaul.OperationMetrics()
+        self.run_start = None
+        self.run_time = None
+        self.run_state = WAITING
+        self.exit_reason = None
+
+        self.heartbeats_sent = ThreadSafeCounter()
+        self.heartbeats_received = ThreadSafeCounter()
+
+        self.pingback_requests_sent = ThreadSafeCounter()
+        self.pingback_responses_received = ThreadSafeCounter()
+        self.pingback_requests_received = ThreadSafeCounter()
+        self.pingback_responses_sent = ThreadSafeCounter()
+
+        self.d2c_inflight = ThreadSafeCounter()
+        self.d2c_succeeded = ThreadSafeCounter()
+        self.d2c_failed = ThreadSafeCounter()
 
 
-class DeviceRunConfig(longhaul.RunConfig):
+class DeviceRunConfig(object):
     """
     Object we use internally to keep track of how the entire test is configured.
+    Currently hardcoded. Later, this will come from desired properties.
     """
 
     def __init__(self):
-        super(DeviceRunConfig, self).__init__()
-        self.d2c = longhaul.OperationConfig()
+        self.max_run_duration = 0
 
+        self.heartbeat_interval = 10
+        self.heartbeat_failure_interval = 30
+        self.thief_property_update_interval = 10
 
-def set_config(config):
-    """
-    Helper function which sets our configuration.  Right now, this is hardcoded.
-    Later, this will come from desired properties.
-    """
-    config.max_run_duration = 0
-    config.d2c.operations_per_second = 5
-    config.d2c.timeout_interval = 60
-    config.d2c.failures_allowed = 0
-    config.d2c.buffer_size = 16 * 1024
+        self.d2c_operations_per_second = 5
+        self.d2c_timeout_interval = 60
+        self.d2c_failures_allowed = 0
 
 
 class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
@@ -93,24 +108,24 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
 
         self.start_reaper()
 
-    def make_new_d2c_payload(self, pingback_id, tracing_carrier=None):
-        """
-        Helper function to create a unique payload which can be sent up as d2c message
-        """
-        msg = {
-            "thief": {
-                "cmd": "pingback",
-                "pingbackId": pingback_id,
-                "buffer": get_random_string(self.config.d2c.buffer_size),
-            }
+    def get_fixed_system_metrics(self):
+        return {
+            "language": "python",
+            "languageVersion": "TODO",
+            "sdkVersion": "TODO",
+            "sdkGithubBranch": "TODO",
+            "sdkGithubCommit": "TODO",
+            "osType": "TODO",
+            "osRelease": "TODO",
         }
 
-        if tracing_carrier:
-            msg["thief"]["tracingCarrier"] = tracing_carrier
+    def get_variable_system_metrics(self):
+        return {
+            "processResidentMemory": "TODO",
+            "processCpuUtilization": "TODO ps -f -p 28603 -o %cpu --no-headers",
+        }
 
-        return Message(json.dumps(msg))
-
-    def get_props_from_metrics(self):
+    def get_longhaul_metrics(self):
         self.metrics.run_time = datetime.datetime.now() - self.metrics.run_start
 
         props = {
@@ -131,6 +146,10 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             "d2c": {
                 "totalSuccessCount": self.metrics.d2c.total_succeeded.get_count(),
                 "totalFailureCount": self.metrics.d2c.total_failed.get_count(),
+                "totalWarningCount": "TODO",
+                "currentQueuedCount": "TODO",
+                "currentInFlightCount": "TODO",
+                "currentUnacknowledgedCount": "TOTO",
             },
         }
         return props
@@ -140,10 +159,25 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         Update reported properties at the start of a run
         """
         # TODO: language and version bits
-        props = {"thief": {"device": self.get_props_from_metrics()}}
+        props = {"thief": {"device": self.get_longhaul_metrics()}}
+        props["thief"]["device"].get_fixed_system_metrics()
+        props["thief"]["device"].get_variable_system_metrics()
 
-        logger.info("Setting initial thief properties: {}".format(props))
         self.client.patch_twin_reported_properties(props)
+
+    # Count in-flight
+    def send_telemetry_thread(self):
+        while not self.done.isSet():
+            msg, tracer = self.telemetry_queue.get(timeout=1)
+            if msg:
+                try:
+                    self.metrics.d2c.inflight.increment()
+                    with tracer.span("thiefSendTelemetry"):
+                        self.client.send_message(msg)
+                finally:
+                    self.metrics.d2c.inflight.decrement()
+
+                self.metrics.pingback_requests_sent.increment()
 
     def test_d2c_thread(self):
         """
@@ -154,11 +188,24 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         while not (self.first_heartbeat_received.isSet() or self.done.isSet()):
             self.first_heartbeat_received.wait(1)
 
-        def send_single_d2c_message():
+        while not self.done.isSet():
+
             tracer = DependencyTracer("thiefSendTelemetryWithPingback")
             pingback_id = str(uuid.uuid4())
 
-            data = self.make_new_d2c_payload(pingback_id, tracing_carrier=tracer.span_to_dict())
+            props = {
+                "thief": {
+                    "cmd": "pingback",
+                    "pingbackId": pingback_id,
+                    "tracingCarrier": tracer.span_to_dict(),
+                    "device": self.get_longhaul_metrics(),
+                }
+            }
+            props["thief"]["device"].update(self.get_variable_system_metrics())
+
+            msg = Message(json.dumps(props))
+            msg.content_type = "application/json"
+            msg.content_encoding = "utf-8"
 
             def on_pingback_received():
                 # TODO: if the pingback is never received, this span is never persisted.  We should record failures.
@@ -168,54 +215,23 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             with self.pingback_list_lock:
                 self.pingback_wait_list[pingback_id] = on_pingback_received
 
-            try:
-                self.metrics.d2c.inflight.increment()
-                with tracer.span("thiefSendTelemetry"):
-                    self.client.send_message(data)
+            self.telemetry_queue.put(msg, tracer)
 
-            finally:
-                self.metrics.d2c.inflight.decrement()
+            # TODO: metrics for sending, etc, are not all plumbed
+            # TODO: get rid of longhaul.py base classes
+            # TODO: Really, get rid of longhaul.py if you can.  And reaper.py.  Seriously.
 
-            self.metrics.pingback_requests_sent.increment()
+            """
+            TODO:
+            while not self.done.isSet():
+                # submit a thread for the new event
+                send_future = self.executor.submit(send_single_d2c_message)
 
-        while not self.done.isSet():
-            # submit a thread for the new event
-            send_future = self.executor.submit(send_single_d2c_message)
-
-            self.update_metrics_on_completion(send_future, self.config.d2c, self.metrics.d2c)
+                self.update_metrics_on_completion(send_future, self.config.d2c, self.metrics.d2c)
+            """
 
             # sleep until we need to send again
             self.done.wait(1 / self.config.d2c.operations_per_second)
-
-    def send_thief_telemetry_thread(self):
-        """
-        Thread to occasionally send telemetry containing information about how the test
-        is progressing
-        """
-        done = False
-
-        while not done:
-            # setting this at the begining and checking at the end guarantees one last update
-            # before the thread dies
-            if self.done.isSet():
-                done = True
-
-            props = {
-                "thief": {
-                    "cmd": "telemetry",
-                    "d2cInFlightCount": self.metrics.d2c.inflight.get_count(),
-                    "d2cSuccessCount": self.metrics.d2c.succeeded.extract_count(),
-                    "d2cFailureCount": self.metrics.d2c.failed.extract_count(),
-                }
-            }
-
-            msg = Message(json.dumps(props))
-            msg.content_type = "application/json"
-            msg.content_encoding = "utf-8"
-            logger.info("Sending thief telementry: {}".format(msg.data))
-            self.client.send_message(msg)
-
-            self.done.wait(self.config.thief_telemetry_send_interval)
 
     def update_thief_properties_thread(self):
         """
@@ -230,7 +246,7 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             if self.done.isSet():
                 done = True
 
-            props = {"thief": {"device": self.get_props_from_metrics()}}
+            props = {"thief": {"device": self.get_longhaul_metrics()}}
 
             logger.info("updating thief props: {}".format(props))
             self.client.patch_twin_reported_properties(props)
@@ -339,7 +355,6 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             self.shutdown_event.set()
 
     def main(self):
-        set_config(self.config)
 
         self.metrics.run_start = datetime.datetime.now()
         self.metrics.run_state = longhaul.RUNNING
@@ -359,10 +374,6 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         )
         self.shutdown_on_future_exit(
             future=self.executor.submit(self.dispatch_c2d_thread), name="c2d_dispatch_thread"
-        )
-        self.shutdown_on_future_exit(
-            future=self.executor.submit(self.send_thief_telemetry_thread),
-            name="send_thief_telemetry_thread",
         )
         self.shutdown_on_future_exit(
             future=self.executor.submit(self.update_thief_properties_thread),

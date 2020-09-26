@@ -16,6 +16,12 @@ from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub.models import Twin, TwinProperties
 from azure.eventhub import EventHubConsumerClient
 from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
+from measurement import ThreadSafeCounter
+
+WAITING = "waiting"
+RUNNING = "running"
+FAILED = "failed"
+COMPLETE = "complete"
 
 logger = logging.getLogger("thief.{}".format(__name__))
 event_logger = get_event_logger("device")
@@ -33,26 +39,36 @@ log_to_azure_monitor("azure")
 enable_tracing("service")
 
 
-class ServiceRunMetrics(longhaul.RunMetrics):
+class ServiceRunMetrics(object):
     """
     Object we use internally to keep track of how a the entire test is performing.
     """
 
     def __init__(self):
-        super(ServiceRunMetrics, self).__init__()
+        self.run_start = None
+        self.run_time = None
+        self.run_state = WAITING
+        self.exit_reason = None
+
+        self.heartbeats_sent = ThreadSafeCounter()
+        self.heartbeats_received = ThreadSafeCounter()
+
+        self.pingback_requests_sent = ThreadSafeCounter()
+        self.pingback_responses_received = ThreadSafeCounter()
+        self.pingback_requests_received = ThreadSafeCounter()
+        self.pingback_responses_sent = ThreadSafeCounter()
 
 
-class ServiceRunConfig(longhaul.RunConfig):
+class ServiceRunConfig(object):
     """
     Object we use internally to keep track of how the entire test is configured.
     """
 
     def __init__(self):
-        super(ServiceRunConfig, self).__init__()
-
-
-def set_config(config):
-    pass
+        self.max_run_duration = 0
+        self.heartbeat_interval = 10
+        self.heartbeat_failure_interval = 30
+        self.thief_property_update_interval = 10
 
 
 def get_device_id_from_event(event):
@@ -348,7 +364,6 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             self.shutdown_event.set()
 
     def main(self):
-        set_config(self.config)
 
         self.metrics.run_start = datetime.datetime.now()
         self.metrics.run_state = longhaul.RUNNING
