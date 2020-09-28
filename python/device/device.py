@@ -10,9 +10,12 @@ import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import dps
-import reaper
 import sys
+import platform
+import psutil
+import queue
 from azure.iot.device import Message
+import azure.iot.device.constant
 from measurement import ThreadSafeCounter
 from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
 
@@ -47,7 +50,8 @@ class DeviceRunMetrics(object):
     """
 
     def __init__(self):
-        self.run_start = None
+        self.run_start_utc = None
+        self.run_end_utc = None
         self.run_time = None
         self.run_state = WAITING
         self.exit_reason = None
@@ -82,7 +86,7 @@ class DeviceRunConfig(object):
         self.d2c_failures_allowed = 0
 
 
-class DeviceApp(reaper.ReaperMixin):
+class DeviceApp(object):
     """
     Main application object
     """
@@ -103,31 +107,36 @@ class DeviceApp(reaper.ReaperMixin):
         self.next_heartbeat_id = 0
         self.last_heartbeat = time.time()
         self.first_heartbeat_received = threading.Event()
-
-        self.start_reaper()
+        # for telemetry
+        self.telemetry_queue = queue.Queue()
 
     def get_fixed_system_metrics(self):
         return {
             "language": "python",
-            "languageVersion": "TODO",
-            "sdkVersion": "TODO",
-            "sdkGithubBranch": "TODO",
-            "sdkGithubCommit": "TODO",
-            "osType": "TODO",
-            "osRelease": "TODO",
+            "languageVersion": platform.python_version(),
+            "sdkVersion": str(azure.iot.device.constant.VERSION),
+            "sdkGithubRepo": os.getenv("THIEF_SDK_GIT_REPO"),
+            "sdkGithubBranch": os.getenv("THIEF_SDK_GIT_BRANCH"),
+            "sdkGithubCommit": os.getenv("THIEF_SDK_GIT_COMMIT"),
+            "osType": platform.system(),
+            "osRelease": platform.version(),
         }
 
     def get_variable_system_metrics(self):
+        process = psutil.Process(os.getpid())
         return {
-            "processResidentMemory": "TODO",
-            "processCpuUtilization": "TODO ps -f -p 28603 -o %cpu --no-headers",
+            "processResidentMemory": process.memory_info().rss / 1024,
+            "processCpuUtilization": process.cpu_percent(),
         }
 
     def get_longhaul_metrics(self):
-        self.metrics.run_time = datetime.datetime.now() - self.metrics.run_start
+        self.metrics.run_time = (
+            datetime.datetime.now(datetime.timezone.utc) - self.metrics.run_start_utc
+        )
 
         props = {
-            "runStart": str(self.metrics.run_start),
+            "runStartUtc": self.metrics.run_start_utc.isoformat(),
+            "runEndUtc": self.metrics.run_end_utc.isoformat() if self.metrics.run_end_utc else None,
             "runTime": str(self.metrics.run_time),
             "runState": str(self.metrics.run_state),
             "exitReason": self.metrics.exit_reason,
@@ -143,7 +152,7 @@ class DeviceApp(reaper.ReaperMixin):
                 "queued": self.telemetry_queue.qsize(),
                 "inFlight": self.metrics.d2c_in_flight.get_count(),
                 "sent": self.metrics.d2c_sent.get_count(),
-                "acknowledged": self.d2c_acknowledged.get_count(),
+                "acknowledged": self.metrics.d2c_acknowledged.get_count(),
             },
         }
         return props
@@ -153,20 +162,26 @@ class DeviceApp(reaper.ReaperMixin):
         Update reported properties at the start of a run
         """
         props = {"thief": {"device": self.get_longhaul_metrics()}}
-        props["thief"]["device"].get_fixed_system_metrics()
-        props["thief"]["device"].get_variable_system_metrics()
+        props["thief"]["device"].update(self.get_fixed_system_metrics())
+        props["thief"]["device"].update(self.get_variable_system_metrics())
 
+        print("patching {}".format(props))
         self.client.patch_twin_reported_properties(props)
 
     def send_telemetry_thread(self):
         """
-        Thread which reads the telemetry queue and sends the telemetry.
+        Thread which reads the telemetry queue and sends the telemetry.  Since send_message is
+        blocking, and we want to overlap send_messsage calls, we create multiple
+        send_telemetry_therad instances so we can send multiple messages at the same time.
 
-        There can and should  be multiple send_telemetry_thread instances since each one can only
-        send a single message at a time.
+        The number of send_telemetry_thread instances is the number of overlapped sent operations
+        we can have
         """
         while not self.done.isSet():
-            msg, tracer = self.telemetry_queue.get(timeout=1)
+            try:
+                msg, tracer = self.telemetry_queue.get(timeout=1)
+            except queue.Empty:
+                msg = None
             if msg:
                 try:
                     self.metrics.d2c_in_flight.increment()
@@ -192,7 +207,10 @@ class DeviceApp(reaper.ReaperMixin):
 
     def test_d2c_thread(self):
         """
-        Thread to continuously send d2c messages throughout the longhaul run
+        Thread to continuously send d2c messages throughout the longhaul run.  This thread doesn't
+        actually send messages becauase send_message is blocking and we want to overlap our send
+        operations.  Instead, this thread adds the messsage to a queue, and relies on a
+        send_telemetry_thread instance to actually send the message.
         """
 
         # Don't start sending until we know that there's a service app on the other side.
@@ -217,11 +235,14 @@ class DeviceApp(reaper.ReaperMixin):
             msg = Message(json.dumps(props))
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
+            msg.custom_properties["eventDateTimeUtc"] = datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat()
 
             def on_pingback_received():
                 # TODO: if the pingback is never received, this span is never persisted.  We should record failures.
                 tracer.end_operation()
-                self.metrics.c2d.increment()
+                self.metrics.d2c_acknowledged.increment()
 
             with self.pingback_list_lock:
                 self.pingback_wait_list[pingback_id] = on_pingback_received
@@ -247,7 +268,7 @@ class DeviceApp(reaper.ReaperMixin):
                 done = True
 
             props = {"thief": {"device": self.get_longhaul_metrics()}}
-            props["thief"]["device"].udpate(self.get_variable_system_metrics())
+            props["thief"]["device"].update(self.get_variable_system_metrics())
 
             logger.info("updating thief props: {}".format(props))
             self.client.patch_twin_reported_properties(props)
@@ -256,8 +277,10 @@ class DeviceApp(reaper.ReaperMixin):
 
     def dispatch_c2d_thread(self):
         """
-        Thread which continuously receives c2d messages throughout the test run.
-        This will be soon renamed to be the c2d_dispatcher_thread.
+        Thread which continuously receives c2d messages throughout the test run.  This
+        thread does minimal processing for each c2d.  If anything complex needs to happen as a
+        result of a c2d message, this thread puts the message into a queue for some other thread
+        to pick up.
         """
         while not self.done.isSet():
             msg = self.client.receive_message(timeout=1)
@@ -285,6 +308,12 @@ class DeviceApp(reaper.ReaperMixin):
                         self.new_pingback_event.set()
 
     def handle_pingback_thread(self):
+        """
+        Thread which resolves the pingback_wait_list (messages waiting for pingback) with the
+        received_pingback_list (pingbacks that we've received) so we can do pingback callbacks.
+        We do this in our own thread because we don't wat to make c2d_dispatcher_thread wait
+        while we do callbacks.
+        """
 
         while not self.done.isSet():
             self.new_pingback_event.clear()
@@ -294,20 +323,15 @@ class DeviceApp(reaper.ReaperMixin):
                 new_list = []
                 for pingback_id in self.received_pingback_list:
                     if pingback_id in self.pingback_wait_list:
+                        # we've received a pingback.  Don't call back here because we're holding
+                        # pingback_lock_list.  Instead, add to a list and call back when we're
+                        # not holding the lock.
                         callbacks.append(self.pingback_wait_list[pingback_id])
                         del self.pingback_wait_list[pingback_id]
                     else:
+                        # Not waiting for this pingback (yet?).  Keep it in our list.
                         new_list.append(pingback_id)
                 self.received_pingback_list = new_list
-                if len(callbacks) or len(self.pingback_wait_list):
-                    # TODO: add this as metric?
-                    print(
-                        "handle_pingback_thread: {} new pingbacks received, {} pingbacks still unknown, waiting for {} pingbacks".format(
-                            len(callbacks),
-                            len(self.received_pingback_list),
-                            len(self.pingback_wait_list),
-                        )
-                    )
 
             for callback in callbacks:
                 callback()
@@ -327,6 +351,7 @@ class DeviceApp(reaper.ReaperMixin):
             self.next_heartbeat_id += 1
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
+            print("sending {}".format(msg))
             self.client.send_message(msg)
             self.metrics.heartbeats_sent.increment()
 
@@ -357,7 +382,7 @@ class DeviceApp(reaper.ReaperMixin):
 
     def main(self):
 
-        self.metrics.run_start = datetime.datetime.now()
+        self.metrics.run_start_utc = datetime.datetime.now(datetime.timezone.utc)
         self.metrics.run_state = RUNNING
 
         # Create our client and push initial properties
@@ -369,53 +394,90 @@ class DeviceApp(reaper.ReaperMixin):
         )
         self.update_initial_reported_properties()
 
-        # spin up threads that are required for operation
-        self.shutdown_on_future_exit(
-            future=self.executor.submit(self.heartbeat_thread), name="heartbeat_thread"
-        )
-        self.shutdown_on_future_exit(
-            future=self.executor.submit(self.dispatch_c2d_thread), name="c2d_dispatch_thread"
-        )
-        self.shutdown_on_future_exit(
-            future=self.executor.submit(self.update_thief_properties_thread),
-            name="update_thief_properties_thread",
-        )
-        self.shutdown_on_future_exit(
-            future=self.executor.submit(self.handle_pingback_thread), name="handle_pingback_thread"
-        )
+        # Make a list of threads to launch
+        threads_to_launch = [
+            (self.heartbeat_thread, "heartbeat_thread"),
+            (self.dispatch_c2d_thread, "c2d_dispatch_thread"),
+            (self.update_thief_properties_thread, "update_thief_properties_thread"),
+            (self.handle_pingback_thread, "handle_pingback_thread"),
+            (self.test_d2c_thread, "test_d2c_thead"),
+        ]
+        for i in range(0, self.config.d2c_operations_per_second * 2):
+            threads_to_launch.append(
+                (self.send_telemetry_thread, "send_telemetry_thread #{}".format(i))
+            )
 
-        # Spin up worker threads for each thing we're testing.
-        self.shutdown_on_future_exit(
-            future=self.executor.submit(self.test_d2c_thread), name="test_d2c_thead"
-        )
+        # Launch the threads.
+        running_threads = []
+        for (threadproc, name) in threads_to_launch:
+            running_threads.append((name, self.executor.submit(threadproc)))
 
-        # Live my life the way I want to until it's time for me to die.
-        self.shutdown_event.wait(timeout=self.config.max_run_duration or None)
+        loop_start_time = time.time()
+        while self.metrics.run_state == RUNNING:
+            for (name, future) in running_threads:
+                if future.done():
+                    try:
+                        error = future.exception(timeout=0)
+                    except Exception as e:
+                        error = e
+                    if not error:
+                        error = Exception("{} thread exited prematurely".format(name))
+
+                    logger.error(
+                        "Future {} is complete because of exception {}".format(name, error),
+                        exc_info=error,
+                    )
+                    self.metrics.run_state = FAILED
+                    self.metrics.exit_reason = str(error)
+
+                elif not future.running():
+                    error = Exception(
+                        "Unexpected: Future {} is not running and not done".format(name)
+                    )
+                    logger.error(str(error), exc_info=error)
+                    self.metrics.run_state = FAILED
+                    self.metrics.exit_reason = str(error)
+
+            if self.config.max_run_duration and (
+                time.time() - loop_start_time > self.config.max_run_duration
+            ):
+                self.metrics.run_state = COMPLETE
+                self.metrics.exit_rason = "Run passed after {}".format(
+                    datetime.timedelta(self.config.max_run_duration)
+                )
+
+            time.sleep(1)
 
         logger.info("Run is complete.  Cleaning up.")
-
-        # set the run state before setting the done event.  This gives the thief threads one more
-        # chance to push their status before we start shutting down
-        if self.metrics.run_state != FAILED:
-            self.metrics.run_state = COMPLETE
-
-        # stop the reaper, then set the "done" event in order to stop all other threads.
-        self.stop_reaper()
+        self.metrics.run_end_utc = datetime.datetime.now(datetime.timezone.utc)
         self.done.set()
+        logger.info("Waiting up to 60 seconds for  all threads to exit")
 
-        logger.info("Waiting for all threads to exit")
+        wait_start = time.time()
+        while len(running_threads) and (time.time() - wait_start < 60):
+            new_list = []
+            for (name, future) in running_threads:
+                if future.done():
+                    error = future.exception()
+                    if error:
+                        logger.warning("Thread {} raised {} on teardown".format(name, error))
+                    logger.info("Thread {} is exited".format(name))
+                else:
+                    new_list.append((name, future))
+                running_threads = new_list
 
-        # wait for all other threads to exit.  This currently waits for all threads, and it can't
-        # "give up" if some threads refuse to exit.
-        self.executor.shutdown()
-
-        logger.info("All threads exited.  Disconnecting")
-
-        self.client.disconnect()
-
-        logger.info("Done disconnecting.  Exiting")
+        if len(running_threads):
+            logger.warning(
+                "Some threads refused to exit: {}".format([t[0] for t in running_threads])
+            )
+        else:
+            logger.info("All threads exited.  Disconnecting")
+            self.executor.shutdown()
+            self.client.disconnect()
+            logger.info("Done disconnecting.  Exiting")
 
         if self.metrics.run_state == FAILED:
+            logger.info("Forcing exit")
             sys.exit(1)
 
 
