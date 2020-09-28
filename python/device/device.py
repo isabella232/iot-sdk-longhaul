@@ -10,20 +10,15 @@ import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import dps
-import sys
 import platform
 import psutil
 import queue
+import app_base
 from azure.iot.device import Message
 import azure.iot.device.constant
 from measurement import ThreadSafeCounter
 from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
 
-
-WAITING = "waiting"
-RUNNING = "running"
-FAILED = "failed"
-COMPLETE = "complete"
 
 logger = logging.getLogger("thief.{}".format(__name__))
 event_logger = get_event_logger("device")
@@ -53,7 +48,7 @@ class DeviceRunMetrics(object):
         self.run_start_utc = None
         self.run_end_utc = None
         self.run_time = None
-        self.run_state = WAITING
+        self.run_state = app_base.WAITING
         self.exit_reason = None
 
         self.heartbeats_sent = ThreadSafeCounter()
@@ -86,7 +81,7 @@ class DeviceRunConfig(object):
         self.d2c_failures_allowed = 0
 
 
-class DeviceApp(object):
+class DeviceApp(app_base.AppBase):
     """
     Main application object
     """
@@ -372,10 +367,10 @@ class DeviceApp(object):
             logger.info("shutdown: event is already set.  ignorning")
         else:
             if error:
-                self.metrics.run_state = FAILED
+                self.metrics.run_state = app_base.FAILED
                 logger.error("shutdown: triggering error shutdown", exc_info=error)
             else:
-                self.metrics.run_state = COMPLETE
+                self.metrics.run_state = app_base.COMPLETE
                 logger.info("shutdown: trigering clean shutdown")
             self.metrics.exit_reason = str(error or "Clean shutdown")
             self.shutdown_event.set()
@@ -383,7 +378,7 @@ class DeviceApp(object):
     def main(self):
 
         self.metrics.run_start_utc = datetime.datetime.now(datetime.timezone.utc)
-        self.metrics.run_state = RUNNING
+        self.metrics.run_state = app_base.RUNNING
 
         # Create our client and push initial properties
         self.client = dps.create_device_client_using_dps_group_key(
@@ -407,78 +402,10 @@ class DeviceApp(object):
                 (self.send_telemetry_thread, "send_telemetry_thread #{}".format(i))
             )
 
-        # Launch the threads.
-        running_threads = []
-        for (threadproc, name) in threads_to_launch:
-            running_threads.append((name, self.executor.submit(threadproc)))
+        self.run_threads(threads_to_launch)
 
-        loop_start_time = time.time()
-        while self.metrics.run_state == RUNNING:
-            for (name, future) in running_threads:
-                if future.done():
-                    try:
-                        error = future.exception(timeout=0)
-                    except Exception as e:
-                        error = e
-                    if not error:
-                        error = Exception("{} thread exited prematurely".format(name))
-
-                    logger.error(
-                        "Future {} is complete because of exception {}".format(name, error),
-                        exc_info=error,
-                    )
-                    self.metrics.run_state = FAILED
-                    self.metrics.exit_reason = str(error)
-
-                elif not future.running():
-                    error = Exception(
-                        "Unexpected: Future {} is not running and not done".format(name)
-                    )
-                    logger.error(str(error), exc_info=error)
-                    self.metrics.run_state = FAILED
-                    self.metrics.exit_reason = str(error)
-
-            if self.config.max_run_duration and (
-                time.time() - loop_start_time > self.config.max_run_duration
-            ):
-                self.metrics.run_state = COMPLETE
-                self.metrics.exit_rason = "Run passed after {}".format(
-                    datetime.timedelta(self.config.max_run_duration)
-                )
-
-            time.sleep(1)
-
-        logger.info("Run is complete.  Cleaning up.")
-        self.metrics.run_end_utc = datetime.datetime.now(datetime.timezone.utc)
-        self.done.set()
-        logger.info("Waiting up to 60 seconds for  all threads to exit")
-
-        wait_start = time.time()
-        while len(running_threads) and (time.time() - wait_start < 60):
-            new_list = []
-            for (name, future) in running_threads:
-                if future.done():
-                    error = future.exception()
-                    if error:
-                        logger.warning("Thread {} raised {} on teardown".format(name, error))
-                    logger.info("Thread {} is exited".format(name))
-                else:
-                    new_list.append((name, future))
-                running_threads = new_list
-
-        if len(running_threads):
-            logger.warning(
-                "Some threads refused to exit: {}".format([t[0] for t in running_threads])
-            )
-        else:
-            logger.info("All threads exited.  Disconnecting")
-            self.executor.shutdown()
-            self.client.disconnect()
-            logger.info("Done disconnecting.  Exiting")
-
-        if self.metrics.run_state == FAILED:
-            logger.info("Forcing exit")
-            sys.exit(1)
+    def disconnect(self):
+        self.client.disconnect()
 
 
 if __name__ == "__main__":

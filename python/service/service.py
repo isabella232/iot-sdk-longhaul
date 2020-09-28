@@ -2,7 +2,6 @@
 # Licensed under the MIT license. See LICENSE file in the project root for
 # full license information.
 import logging
-import reaper
 import time
 import os
 import queue
@@ -72,7 +71,7 @@ def get_device_id_from_event(event):
     return event.message.annotations["iothub-connection-device-id".encode()].decode()
 
 
-class ServiceApp(reaper.ReaperMixin):
+class ServiceApp:
     """
     Main application object
     """
@@ -295,6 +294,8 @@ class ServiceApp(reaper.ReaperMixin):
         """
         done = False
 
+        # TODO: update properties to match device app
+
         while not done:
             # setting this at the begining and checking at the end guarantees one last update
             # before the thread dies
@@ -340,23 +341,6 @@ class ServiceApp(reaper.ReaperMixin):
 
         if not device:
             raise Exception("Device does not exist.  Cannot continue")
-
-    def shutdown(self, error):
-        """
-        Shutdown the test.  This function can be called from any tread in order to trigger
-        the shutdown of the test
-        """
-        if self.shutdown_event.isSet():
-            logger.info("shutdown: event is already set.  ignorning")
-        else:
-            if error:
-                self.metrics.run_state = FAILED
-                logger.error("shutdown: triggering error shutdown", exc_info=error)
-            else:
-                self.metrics.run_state = COMPLETE
-                logger.info("shutdown: triggering clean shutdown")
-            self.metrics.exit_reason = str(error or "Clean shutdown")
-            self.shutdown_event.set()
 
     def main(self):
 
