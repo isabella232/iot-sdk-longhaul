@@ -89,7 +89,6 @@ class DeviceApp(app_base.AppBase):
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=128)
         self.done = threading.Event()
-        self.shutdown_event = threading.Event()
         self.client = None
         self.metrics = DeviceRunMetrics()
         self.config = DeviceRunConfig()
@@ -174,10 +173,11 @@ class DeviceApp(app_base.AppBase):
         """
         while not self.done.isSet():
             try:
-                msg, tracer = self.telemetry_queue.get(timeout=1)
+                (msg, tracer) = self.telemetry_queue.get(timeout=1)
             except queue.Empty:
                 msg = None
             if msg:
+                print("Sending {}".format(msg))
                 try:
                     self.metrics.d2c_in_flight.increment()
                     with tracer.span("thiefSendTelemetry"):
@@ -234,20 +234,20 @@ class DeviceApp(app_base.AppBase):
                 datetime.timezone.utc
             ).isoformat()
 
-            def on_pingback_received():
+            def on_pingback_received(tracer, pingback_id):
                 # TODO: if the pingback is never received, this span is never persisted.  We should record failures.
                 tracer.end_operation()
                 self.metrics.d2c_acknowledged.increment()
 
             with self.pingback_list_lock:
-                self.pingback_wait_list[pingback_id] = on_pingback_received
+                self.pingback_wait_list[pingback_id] = (on_pingback_received, (tracer, pingback_id))
 
             # This function only queues the message.  A send_telemetry_thread instance will pick
             # it up and send it.
-            self.telemetry_queue.put(msg, tracer)
+            self.telemetry_queue.put((msg, tracer))
 
             # sleep until we need to send again
-            self.done.wait(1 / self.config.d2c.operations_per_second)
+            self.done.wait(1 / self.config.d2c_operations_per_second)
 
     def update_thief_properties_thread(self):
         """
@@ -328,8 +328,8 @@ class DeviceApp(app_base.AppBase):
                         new_list.append(pingback_id)
                 self.received_pingback_list = new_list
 
-            for callback in callbacks:
-                callback()
+            for (function, args) in callbacks:
+                function(*args)
 
             self.new_pingback_event.wait(timeout=1)
 
@@ -346,7 +346,6 @@ class DeviceApp(app_base.AppBase):
             self.next_heartbeat_id += 1
             msg.content_type = "application/json"
             msg.content_encoding = "utf-8"
-            print("sending {}".format(msg))
             self.client.send_message(msg)
             self.metrics.heartbeats_sent.increment()
 
@@ -357,23 +356,6 @@ class DeviceApp(app_base.AppBase):
                 )
 
             time.sleep(self.config.heartbeat_interval)
-
-    def shutdown(self, error):
-        """
-        Shutdown the test.  This function can be called from any tread in order to trigger
-        the shutdown of the test
-        """
-        if self.shutdown_event.isSet():
-            logger.info("shutdown: event is already set.  ignorning")
-        else:
-            if error:
-                self.metrics.run_state = app_base.FAILED
-                logger.error("shutdown: triggering error shutdown", exc_info=error)
-            else:
-                self.metrics.run_state = app_base.COMPLETE
-                logger.info("shutdown: trigering clean shutdown")
-            self.metrics.exit_reason = str(error or "Clean shutdown")
-            self.shutdown_event.set()
 
     def main(self):
 
