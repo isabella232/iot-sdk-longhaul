@@ -121,15 +121,16 @@ class DependencyTracer(contextlib.AbstractContextManager):
     def __del__(self):
         self.end_operation()
 
-    def __exit__(self, *exc):
+    def __exit__(self, exception_type, exception_value, traceback):
         # so we can use DependencyTracer as a context manager
-        self.end_operation()
+        self.end_operation(exception_value)
 
     def span(self, name):
         return self.tracer.span(name)
 
-    def end_operation(self):
+    def end_operation(self, error):
         if self.outer_span:
+            # TODO: flag error here.  This is being used when send_event raises
             self.outer_span.finish()
             self.tracer.end_span()
 

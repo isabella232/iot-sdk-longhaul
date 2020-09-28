@@ -2,7 +2,6 @@
 # Licensed under the MIT license. See LICENSE file in the project root for
 # full license information.
 import logging
-import longhaul
 import reaper
 import time
 import os
@@ -53,8 +52,6 @@ class ServiceRunMetrics(object):
         self.heartbeats_sent = ThreadSafeCounter()
         self.heartbeats_received = ThreadSafeCounter()
 
-        self.pingback_requests_sent = ThreadSafeCounter()
-        self.pingback_responses_received = ThreadSafeCounter()
         self.pingback_requests_received = ThreadSafeCounter()
         self.pingback_responses_sent = ThreadSafeCounter()
 
@@ -68,14 +65,14 @@ class ServiceRunConfig(object):
         self.max_run_duration = 0
         self.heartbeat_interval = 10
         self.heartbeat_failure_interval = 30
-        self.thief_property_update_interval = 10
+        self.thief_property_update_interval = 60
 
 
 def get_device_id_from_event(event):
     return event.message.annotations["iothub-connection-device-id".encode()].decode()
 
 
-class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
+class ServiceApp(reaper.ReaperMixin):
     """
     Main application object
     """
@@ -117,8 +114,6 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                 "received": self.metrics.heartbeats_received.get_count(),
             },
             "pingbacks": {
-                "requestsSent": self.metrics.pingback_requests_sent.get_count(),
-                "responsesReceived": self.metrics.pingback_responses_received.get_count(),
                 "requestsReceived": self.metrics.pingback_requests_received.get_count(),
                 "responsesSent": self.metrics.pingback_responses_sent.get_count(),
             },
@@ -355,10 +350,10 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             logger.info("shutdown: event is already set.  ignorning")
         else:
             if error:
-                self.metrics.run_state = longhaul.FAILED
+                self.metrics.run_state = FAILED
                 logger.error("shutdown: triggering error shutdown", exc_info=error)
             else:
-                self.metrics.run_state = longhaul.COMPLETE
+                self.metrics.run_state = COMPLETE
                 logger.info("shutdown: triggering clean shutdown")
             self.metrics.exit_reason = str(error or "Clean shutdown")
             self.shutdown_event.set()
@@ -366,7 +361,7 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
     def main(self):
 
         self.metrics.run_start = datetime.datetime.now()
-        self.metrics.run_state = longhaul.RUNNING
+        self.metrics.run_state = RUNNING
 
         with self.registry_manager_lock:
             self.registry_manager = IoTHubRegistryManager(iothub_connection_string)
@@ -417,7 +412,7 @@ class ServiceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
 
         logger.info("Done disconnecting.  Exiting")
 
-        if self.metrics.run_state == longhaul.FAILED:
+        if self.metrics.run_state == FAILED:
             sys.exit(1)
 
 

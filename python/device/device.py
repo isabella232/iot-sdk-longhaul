@@ -10,7 +10,6 @@ import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import dps
-import longhaul
 import reaper
 import sys
 from azure.iot.device import Message
@@ -58,11 +57,10 @@ class DeviceRunMetrics(object):
 
         self.pingback_requests_sent = ThreadSafeCounter()
         self.pingback_responses_received = ThreadSafeCounter()
-        self.pingback_requests_received = ThreadSafeCounter()
-        self.pingback_responses_sent = ThreadSafeCounter()
 
-        self.d2c_inflight = ThreadSafeCounter()
-        self.d2c_succeeded = ThreadSafeCounter()
+        self.d2c_in_flight = ThreadSafeCounter()
+        self.d2c_sent = ThreadSafeCounter()
+        self.d2c_acknowledged = ThreadSafeCounter()
         self.d2c_failed = ThreadSafeCounter()
 
 
@@ -77,14 +75,14 @@ class DeviceRunConfig(object):
 
         self.heartbeat_interval = 10
         self.heartbeat_failure_interval = 30
-        self.thief_property_update_interval = 10
+        self.thief_property_update_interval = 60
 
         self.d2c_operations_per_second = 5
         self.d2c_timeout_interval = 60
         self.d2c_failures_allowed = 0
 
 
-class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
+class DeviceApp(reaper.ReaperMixin):
     """
     Main application object
     """
@@ -140,16 +138,12 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             "pingbacks": {
                 "requestsSent": self.metrics.pingback_requests_sent.get_count(),
                 "responsesReceived": self.metrics.pingback_responses_received.get_count(),
-                "requestsReceived": self.metrics.pingback_requests_received.get_count(),
-                "responsesSent": self.metrics.pingback_responses_sent.get_count(),
             },
             "d2c": {
-                "totalSuccessCount": self.metrics.d2c.total_succeeded.get_count(),
-                "totalFailureCount": self.metrics.d2c.total_failed.get_count(),
-                "totalWarningCount": "TODO",
-                "currentQueuedCount": "TODO",
-                "currentInFlightCount": "TODO",
-                "currentUnacknowledgedCount": "TOTO",
+                "queued": self.telemetry_queue.qsize(),
+                "inFlight": self.metrics.d2c_in_flight.get_count(),
+                "sent": self.metrics.d2c_sent.get_count(),
+                "acknowledged": self.d2c_acknowledged.get_count(),
             },
         }
         return props
@@ -158,26 +152,43 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
         """
         Update reported properties at the start of a run
         """
-        # TODO: language and version bits
         props = {"thief": {"device": self.get_longhaul_metrics()}}
         props["thief"]["device"].get_fixed_system_metrics()
         props["thief"]["device"].get_variable_system_metrics()
 
         self.client.patch_twin_reported_properties(props)
 
-    # Count in-flight
     def send_telemetry_thread(self):
+        """
+        Thread which reads the telemetry queue and sends the telemetry.
+
+        There can and should  be multiple send_telemetry_thread instances since each one can only
+        send a single message at a time.
+        """
         while not self.done.isSet():
             msg, tracer = self.telemetry_queue.get(timeout=1)
             if msg:
                 try:
-                    self.metrics.d2c.inflight.increment()
+                    self.metrics.d2c_in_flight.increment()
                     with tracer.span("thiefSendTelemetry"):
                         self.client.send_message(msg)
+                except Exception as e:
+                    # TODO: check failure count
+                    # TODO: look at duration and flag
+                    # TODO: add enqueued time somewhere
+                    self.metrics.d2c_failed.increment()
+                    logger.error(
+                        "send_message raised {}".format(e),
+                        exc_info=True,
+                        extra=tracer.get_logging_tags(),
+                    )
+                    tracer.end_operation(e)
+                else:
+                    self.metrics.pingback_requests_sent.increment()
+                    self.metrics.d2c_sent.increment()
+                    tracer.end_operation()
                 finally:
-                    self.metrics.d2c.inflight.decrement()
-
-                self.metrics.pingback_requests_sent.increment()
+                    self.metrics.d2c_in_flight.decrement()
 
     def test_d2c_thread(self):
         """
@@ -210,25 +221,14 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             def on_pingback_received():
                 # TODO: if the pingback is never received, this span is never persisted.  We should record failures.
                 tracer.end_operation()
-                self.metrics.d2c.verified.add(1)
+                self.metrics.c2d.increment()
 
             with self.pingback_list_lock:
                 self.pingback_wait_list[pingback_id] = on_pingback_received
 
+            # This function only queues the message.  A send_telemetry_thread instance will pick
+            # it up and send it.
             self.telemetry_queue.put(msg, tracer)
-
-            # TODO: metrics for sending, etc, are not all plumbed
-            # TODO: get rid of longhaul.py base classes
-            # TODO: Really, get rid of longhaul.py if you can.  And reaper.py.  Seriously.
-
-            """
-            TODO:
-            while not self.done.isSet():
-                # submit a thread for the new event
-                send_future = self.executor.submit(send_single_d2c_message)
-
-                self.update_metrics_on_completion(send_future, self.config.d2c, self.metrics.d2c)
-            """
 
             # sleep until we need to send again
             self.done.wait(1 / self.config.d2c.operations_per_second)
@@ -247,6 +247,7 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
                 done = True
 
             props = {"thief": {"device": self.get_longhaul_metrics()}}
+            props["thief"]["device"].udpate(self.get_variable_system_metrics())
 
             logger.info("updating thief props: {}".format(props))
             self.client.patch_twin_reported_properties(props)
@@ -346,10 +347,10 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
             logger.info("shutdown: event is already set.  ignorning")
         else:
             if error:
-                self.metrics.run_state = longhaul.FAILED
+                self.metrics.run_state = FAILED
                 logger.error("shutdown: triggering error shutdown", exc_info=error)
             else:
-                self.metrics.run_state = longhaul.COMPLETE
+                self.metrics.run_state = COMPLETE
                 logger.info("shutdown: trigering clean shutdown")
             self.metrics.exit_reason = str(error or "Clean shutdown")
             self.shutdown_event.set()
@@ -357,7 +358,7 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
     def main(self):
 
         self.metrics.run_start = datetime.datetime.now()
-        self.metrics.run_state = longhaul.RUNNING
+        self.metrics.run_state = RUNNING
 
         # Create our client and push initial properties
         self.client = dps.create_device_client_using_dps_group_key(
@@ -395,8 +396,8 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
 
         # set the run state before setting the done event.  This gives the thief threads one more
         # chance to push their status before we start shutting down
-        if self.metrics.run_state != longhaul.FAILED:
-            self.metrics.run_state = longhaul.COMPLETE
+        if self.metrics.run_state != FAILED:
+            self.metrics.run_state = COMPLETE
 
         # stop the reaper, then set the "done" event in order to stop all other threads.
         self.stop_reaper()
@@ -414,7 +415,7 @@ class DeviceApp(longhaul.LonghaulMixin, reaper.ReaperMixin):
 
         logger.info("Done disconnecting.  Exiting")
 
-        if self.metrics.run_state == longhaul.FAILED:
+        if self.metrics.run_state == FAILED:
             sys.exit(1)
 
 
