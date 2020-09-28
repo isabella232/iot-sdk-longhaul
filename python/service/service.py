@@ -9,12 +9,15 @@ import threading
 import json
 import datetime
 import app_base
+import platform
+import psutil
 from concurrent.futures import ThreadPoolExecutor
 from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub.models import Twin, TwinProperties
 from azure.eventhub import EventHubConsumerClient
 from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
 from measurement import ThreadSafeCounter
+import azure.iot.hub.constant
 
 logger = logging.getLogger("thief.{}".format(__name__))
 event_logger = get_event_logger("device")
@@ -38,7 +41,8 @@ class ServiceRunMetrics(object):
     """
 
     def __init__(self):
-        self.run_start = None
+        self.run_start_utc = None
+        self.run_end_utc = None
         self.run_time = None
         self.run_state = app_base.WAITING
         self.exit_reason = None
@@ -57,6 +61,7 @@ class ServiceRunConfig(object):
 
     def __init__(self):
         self.max_run_duration = 0
+
         self.heartbeat_interval = 10
         self.heartbeat_failure_interval = 30
         self.thief_property_update_interval = 60
@@ -93,11 +98,33 @@ class ServiceApp(app_base.AppBase):
         self.next_heartbeat_id = 10000
         self.first_heartbeat_received = threading.Event()
 
-    def get_props_from_metrics(self):
-        self.metrics.run_time = datetime.datetime.now() - self.metrics.run_start
+    def get_fixed_system_metrics(self):
+        return {
+            "language": "python",
+            "languageVersion": platform.python_version(),
+            "sdkVersion": str(azure.iot.hub.constant.VERSION),
+            "sdkGithubRepo": os.getenv("THIEF_SDK_GIT_REPO"),
+            "sdkGithubBranch": os.getenv("THIEF_SDK_GIT_BRANCH"),
+            "sdkGithubCommit": os.getenv("THIEF_SDK_GIT_COMMIT"),
+            "osType": platform.system(),
+            "osRelease": platform.version(),
+        }
+
+    def get_variable_system_metrics(self):
+        process = psutil.Process(os.getpid())
+        return {
+            "processResidentMemory": process.memory_info().rss / 1024,
+            "processCpuUtilization": process.cpu_percent(),
+        }
+
+    def get_longhaul_metrics(self):
+        self.metrics.run_time = (
+            datetime.datetime.now(datetime.timezone.utc) - self.metrics.run_start_utc
+        )
 
         props = {
-            "runStart": str(self.metrics.run_start),
+            "runStartUtc": self.metrics.run_start_utc.isoformat(),
+            "runEndUtc": self.metrics.run_end_utc.isoformat() if self.metrics.run_end_utc else None,
             "runTime": str(self.metrics.run_time),
             "runState": str(self.metrics.run_state),
             "exitReason": self.metrics.exit_reason,
@@ -116,12 +143,13 @@ class ServiceApp(app_base.AppBase):
         """
         Update reported properties at the start of a run
         """
-        # TODO language and version bits
+
+        props = {"thief": {"service": self.get_fixed_system_metrics()}}
+        props["thief"]["service"].update(self.get_fixed_system_metrics())
+        props["thief"]["service"].update(self.get_variable_system_metrics())
 
         twin = Twin()
-        twin.properties = TwinProperties(
-            desired={"thief": {"service": self.get_props_from_metrics()}}
-        )
+        twin.properties = TwinProperties(desired=props)
 
         logger.info("Setting initial thief properties: {}".format(twin.properties))
         with self.registry_manager_lock:
@@ -285,18 +313,17 @@ class ServiceApp(app_base.AppBase):
         """
         done = False
 
-        # TODO: update properties to match device app
-
         while not done:
             # setting this at the begining and checking at the end guarantees one last update
             # before the thread dies
             if self.done.isSet():
                 done = True
 
+            props = {"thief": {"service": self.get_longhaul_metrics()}}
+            props["thief"]["service"].update(self.get_variable_system_metrics())
+
             twin = Twin()
-            twin.properties = TwinProperties(
-                desired={"thief": {"service": self.get_props_from_metrics()}}
-            )
+            twin.properties = TwinProperties(desired=props)
 
             logger.info("Updating thief properties: {}".format(twin.properties))
             with self.registry_manager_lock:
@@ -335,7 +362,7 @@ class ServiceApp(app_base.AppBase):
 
     def main(self):
 
-        self.metrics.run_start = datetime.datetime.now()
+        self.metrics.run_start_utc = datetime.datetime.now(datetime.timezone.utc)
         self.metrics.run_state = app_base.RUNNING
 
         with self.registry_manager_lock:
