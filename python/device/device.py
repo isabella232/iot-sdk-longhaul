@@ -10,8 +10,6 @@ import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import dps
-import platform
-import psutil
 import queue
 import app_base
 from azure.iot.device import Message
@@ -104,25 +102,6 @@ class DeviceApp(app_base.AppBase):
         # for telemetry
         self.telemetry_queue = queue.Queue()
 
-    def get_fixed_system_metrics(self):
-        return {
-            "language": "python",
-            "languageVersion": platform.python_version(),
-            "sdkVersion": str(azure.iot.device.constant.VERSION),
-            "sdkGithubRepo": os.getenv("THIEF_SDK_GIT_REPO"),
-            "sdkGithubBranch": os.getenv("THIEF_SDK_GIT_BRANCH"),
-            "sdkGithubCommit": os.getenv("THIEF_SDK_GIT_COMMIT"),
-            "osType": platform.system(),
-            "osRelease": platform.version(),
-        }
-
-    def get_variable_system_metrics(self):
-        process = psutil.Process(os.getpid())
-        return {
-            "processResidentMemory": process.memory_info().rss / 1024,
-            "processCpuUtilization": process.cpu_percent(),
-        }
-
     def get_longhaul_metrics(self):
         self.metrics.run_time = (
             datetime.datetime.now(datetime.timezone.utc) - self.metrics.run_start_utc
@@ -156,7 +135,9 @@ class DeviceApp(app_base.AppBase):
         Update reported properties at the start of a run
         """
         props = {"thief": {"device": self.get_longhaul_metrics()}}
-        props["thief"]["device"].update(self.get_fixed_system_metrics())
+        props["thief"]["device"].update(
+            self.get_fixed_system_metrics(azure.iot.device.constant.VERSION)
+        )
         props["thief"]["device"].update(self.get_variable_system_metrics())
 
         print("patching {}".format(props))
@@ -177,7 +158,6 @@ class DeviceApp(app_base.AppBase):
             except queue.Empty:
                 msg = None
             if msg:
-                print("Sending {}".format(msg))
                 try:
                     self.metrics.d2c_in_flight.increment()
                     with tracer.span("thiefSendTelemetry"):

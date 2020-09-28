@@ -9,8 +9,6 @@ import threading
 import json
 import datetime
 import app_base
-import platform
-import psutil
 from concurrent.futures import ThreadPoolExecutor
 from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub.models import Twin, TwinProperties
@@ -20,7 +18,7 @@ from measurement import ThreadSafeCounter
 import azure.iot.hub.constant
 
 logger = logging.getLogger("thief.{}".format(__name__))
-event_logger = get_event_logger("device")
+event_logger = get_event_logger("service")
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("thief").setLevel(level=logging.INFO)
@@ -98,25 +96,6 @@ class ServiceApp(app_base.AppBase):
         self.next_heartbeat_id = 10000
         self.first_heartbeat_received = threading.Event()
 
-    def get_fixed_system_metrics(self):
-        return {
-            "language": "python",
-            "languageVersion": platform.python_version(),
-            "sdkVersion": str(azure.iot.hub.constant.VERSION),
-            "sdkGithubRepo": os.getenv("THIEF_SDK_GIT_REPO"),
-            "sdkGithubBranch": os.getenv("THIEF_SDK_GIT_BRANCH"),
-            "sdkGithubCommit": os.getenv("THIEF_SDK_GIT_COMMIT"),
-            "osType": platform.system(),
-            "osRelease": platform.version(),
-        }
-
-    def get_variable_system_metrics(self):
-        process = psutil.Process(os.getpid())
-        return {
-            "processResidentMemory": process.memory_info().rss / 1024,
-            "processCpuUtilization": process.cpu_percent(),
-        }
-
     def get_longhaul_metrics(self):
         self.metrics.run_time = (
             datetime.datetime.now(datetime.timezone.utc) - self.metrics.run_start_utc
@@ -144,8 +123,10 @@ class ServiceApp(app_base.AppBase):
         Update reported properties at the start of a run
         """
 
-        props = {"thief": {"service": self.get_fixed_system_metrics()}}
-        props["thief"]["service"].update(self.get_fixed_system_metrics())
+        props = {"thief": {"service": self.get_longhaul_metrics()}}
+        props["thief"]["service"].update(
+            self.get_fixed_system_metrics(azure.iot.hub.constant.VERSION)
+        )
         props["thief"]["service"].update(self.get_variable_system_metrics())
 
         twin = Twin()

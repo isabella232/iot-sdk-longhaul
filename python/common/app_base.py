@@ -7,6 +7,9 @@ import abc
 import time
 import datetime
 import sys
+import platform
+import os
+import psutil
 
 
 logger = logging.getLogger("thief.{}".format(__name__))
@@ -25,6 +28,25 @@ class AppBase(object):
 
     def pre_shutdown(self):
         pass
+
+    def get_fixed_system_metrics(self, version):
+        return {
+            "language": "python",
+            "languageVersion": platform.python_version(),
+            "sdkVersion": version,
+            "sdkGithubRepo": os.getenv("THIEF_SDK_GIT_REPO"),
+            "sdkGithubBranch": os.getenv("THIEF_SDK_GIT_BRANCH"),
+            "sdkGithubCommit": os.getenv("THIEF_SDK_GIT_COMMIT"),
+            "osType": platform.system(),
+            "osRelease": platform.version(),
+        }
+
+    def get_variable_system_metrics(self):
+        process = psutil.Process(os.getpid())
+        return {
+            "processResidentMemory": process.memory_info().rss / 1024,
+            "processCpuUtilization": process.cpu_percent(),
+        }
 
     def run_threads(self, threads_to_launch):
         # Launch the threads.

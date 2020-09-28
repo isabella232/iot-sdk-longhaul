@@ -42,8 +42,8 @@ def get_event_logger(client_type):
     handler = AzureEventHandler(connection_string=ai_connection_string)
     handler.add_telemetry_processor(_get_telemetry_processor_callback(client_type))
 
+    handler.setLevel(logging.INFO)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
 
     return logger
 
