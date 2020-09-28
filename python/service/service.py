@@ -7,19 +7,14 @@ import os
 import queue
 import threading
 import json
-import sys
 import datetime
+import app_base
 from concurrent.futures import ThreadPoolExecutor
 from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub.models import Twin, TwinProperties
 from azure.eventhub import EventHubConsumerClient
 from azure_monitor import enable_tracing, get_event_logger, log_to_azure_monitor, DependencyTracer
 from measurement import ThreadSafeCounter
-
-WAITING = "waiting"
-RUNNING = "running"
-FAILED = "failed"
-COMPLETE = "complete"
 
 logger = logging.getLogger("thief.{}".format(__name__))
 event_logger = get_event_logger("device")
@@ -45,7 +40,7 @@ class ServiceRunMetrics(object):
     def __init__(self):
         self.run_start = None
         self.run_time = None
-        self.run_state = WAITING
+        self.run_state = app_base.WAITING
         self.exit_reason = None
 
         self.heartbeats_sent = ThreadSafeCounter()
@@ -71,7 +66,7 @@ def get_device_id_from_event(event):
     return event.message.annotations["iothub-connection-device-id".encode()].decode()
 
 
-class ServiceApp:
+class ServiceApp(app_base.AppBase):
     """
     Main application object
     """
@@ -89,7 +84,7 @@ class ServiceApp:
         # for any kind of c2d
         self.c2d_send_queue = queue.Queue()
 
-        # for pingbacks
+        # futor pingbacks
         self.pingback_events = queue.Queue()
         self.pingback_events_lock = threading.Lock()
 
@@ -97,8 +92,6 @@ class ServiceApp:
         self.last_heartbeat = time.time()
         self.next_heartbeat_id = 10000
         self.first_heartbeat_received = threading.Event()
-
-        self.start_reaper()
 
     def get_props_from_metrics(self):
         self.metrics.run_time = datetime.datetime.now() - self.metrics.run_start
@@ -259,25 +252,23 @@ class ServiceApp:
         also for making sure that heartbeat messages are received often enough
         """
 
-        # Don't start sending heartbeats until we receive our first heartbeat from
-        # the other side
-        while not (self.first_heartbeat_received.isSet() or self.done.isSet()):
-            self.first_heartbeat_received.wait(1)
-
         while not self.done.isSet():
-            message = json.dumps(
-                {"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}}
-            )
-
-            self.c2d_send_queue.put(
-                (
-                    device_id,
-                    message,
-                    {"contentType": "application/json", "contentEncoding": "utf-8"},
+            # Don't start sending heartbeats until we receive our first heartbeat from
+            # the other side
+            if self.first_heartbeat_received.is_set():
+                message = json.dumps(
+                    {"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}}
                 )
-            )
-            self.next_heartbeat_id += 1
-            self.metrics.heartbeats_sent.increment()
+
+                self.c2d_send_queue.put(
+                    (
+                        device_id,
+                        message,
+                        {"contentType": "application/json", "contentEncoding": "utf-8"},
+                    )
+                )
+                self.next_heartbeat_id += 1
+                self.metrics.heartbeats_sent.increment()
 
             seconds_since_last_heartbeat = time.time() - self.last_heartbeat
             if seconds_since_last_heartbeat > self.config.heartbeat_failure_interval:
@@ -345,7 +336,7 @@ class ServiceApp:
     def main(self):
 
         self.metrics.run_start = datetime.datetime.now()
-        self.metrics.run_state = RUNNING
+        self.metrics.run_state = app_base.RUNNING
 
         with self.registry_manager_lock:
             self.registry_manager = IoTHubRegistryManager(iothub_connection_string)
@@ -357,47 +348,26 @@ class ServiceApp:
             eventhub_connection_string, consumer_group=eventhub_consumer_group
         )
 
-        # spin up threads that are required for operation
-        self.shutdown_on_future_exit(
-            self.executor.submit(self.eventhub_dispatcher_thread), name="eventhub_dispatcher_thread"
-        )
-        self.shutdown_on_future_exit(
-            self.executor.submit(self.c2d_sender_thread), name="c2d_sender_thread"
-        )
-        self.shutdown_on_future_exit(
-            self.executor.submit(self.pingback_thread), name="pingback_thread"
-        )
-        self.shutdown_on_future_exit(
-            self.executor.submit(self.heartbeat_thread), name="heartbeat_thread"
-        )
-        self.shutdown_on_future_exit(
-            self.executor.submit(self.update_thief_properties_thread),
-            name="update_thief_properties_thread",
-        )
+        threads_to_launch = [
+            (self.eventhub_dispatcher_thread, "eventhub_dispatcher_thread"),
+            (self.c2d_sender_thread, "c2d_sender_thread"),
+            (self.pingback_thread, "pingback_thread"),
+            (self.heartbeat_thread, "heartbeat_thread"),
+            (self.update_thief_properties_thread, "update_thief_properties_thread"),
+        ]
 
-        # Live my life the way I want to until it's time for me to die.
-        self.shutdown_event.wait(timeout=self.config.max_run_duration or None)
+        self.run_threads(threads_to_launch)
 
-        logger.info("Run is complete.  Cleaning up.")
-
-        # stop the reaper, then set the "done" event in order to stop all other threads.
-        self.stop_reaper()
-        self.done.set()
-
-        # close the eventhub consumer before shutting down the executor.  This is necessary because
+    def pre_shutdown(self):
+        # close the eventhub consumer before shutting down threads.  This is necessary because
         # the "receive" function that we use to receive EventHub events is blocking and doesn't
         # have a timeout.
         logger.info("closing eventhub listener")
         self.eventhub_consumer_client.close()
 
-        # wait for all other threads to exit.  This currently waits for all threads, and it can't
-        # "give up" if some threads refuse to exit.
-        self.executor.shutdown()
-
-        logger.info("Done disconnecting.  Exiting")
-
-        if self.metrics.run_state == FAILED:
-            sys.exit(1)
+    def disconnect(self):
+        # nothing to do
+        pass
 
 
 if __name__ == "__main__":

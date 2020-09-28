@@ -23,10 +23,14 @@ class AppBase(object):
     def disconnect(self):
         pass
 
+    def pre_shutdown(self):
+        pass
+
     def run_threads(self, threads_to_launch):
         # Launch the threads.
         running_threads = []
         for (threadproc, name) in threads_to_launch:
+            logger.info("Launching {}".format(name))
             running_threads.append((name, self.executor.submit(threadproc)))
 
         loop_start_time = time.time()
@@ -68,6 +72,7 @@ class AppBase(object):
         logger.info("Run is complete.  Cleaning up.")
         self.metrics.run_end_utc = datetime.datetime.now(datetime.timezone.utc)
         self.done.set()
+        self.pre_shutdown()
         logger.info("Waiting up to 60 seconds for  all threads to exit")
 
         wait_start = time.time()
