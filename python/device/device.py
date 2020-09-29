@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft. All rights reserved.
+# ( Copyright (c) Microsoft. All rights reserved.
 # Licensed under the MIT license. See LICENSE file in the project root for
 # full license information.
 import logging
@@ -68,15 +68,17 @@ class DeviceRunConfig(object):
     """
 
     def __init__(self):
-        self.max_run_duration = 0
+        self.max_run_duration = 60
 
         self.heartbeat_interval = 10
         self.heartbeat_failure_interval = 30
         self.thief_property_update_interval = 60
+        self.watchdog_failure_interval = 300
 
         self.d2c_operations_per_second = 5
-        self.d2c_timeout_interval = 60
-        self.d2c_failures_allowed = 0
+        self.d2c_slowness_threshold = 60
+        self.d2c_failures_allowed = 10
+        self.d2c_slow_operations_allowed = 100
 
 
 class DeviceApp(app_base.AppBase):
@@ -143,7 +145,7 @@ class DeviceApp(app_base.AppBase):
         print("patching {}".format(props))
         self.client.patch_twin_reported_properties(props)
 
-    def send_telemetry_thread(self):
+    def send_telemetry_thread(self, worker_thread_info):
         """
         Thread which reads the telemetry queue and sends the telemetry.  Since send_message is
         blocking, and we want to overlap send_messsage calls, we create multiple
@@ -153,6 +155,7 @@ class DeviceApp(app_base.AppBase):
         we can have
         """
         while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
             try:
                 (msg, tracer) = self.telemetry_queue.get(timeout=1)
             except queue.Empty:
@@ -166,6 +169,7 @@ class DeviceApp(app_base.AppBase):
                     # TODO: check failure count
                     # TODO: look at duration and flag
                     # TODO: add enqueued time somewhere
+                    # TODO: each future has a pointer to a struture with timeout time.  It can warn  or fail.  send_message should be wrpped with exception handler and should check expiration time.  There should be a timeout failure case -- we can't handle timeouts gracefull
                     self.metrics.d2c_failed.increment()
                     logger.error(
                         "send_message raised {}".format(e),
@@ -180,7 +184,7 @@ class DeviceApp(app_base.AppBase):
                 finally:
                     self.metrics.d2c_in_flight.decrement()
 
-    def test_d2c_thread(self):
+    def test_d2c_thread(self, worker_thread_info):
         """
         Thread to continuously send d2c messages throughout the longhaul run.  This thread doesn't
         actually send messages becauase send_message is blocking and we want to overlap our send
@@ -193,6 +197,7 @@ class DeviceApp(app_base.AppBase):
             self.first_heartbeat_received.wait(1)
 
         while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
 
             tracer = DependencyTracer("thiefSendTelemetryWithPingback")
             pingback_id = str(uuid.uuid4())
@@ -229,7 +234,7 @@ class DeviceApp(app_base.AppBase):
             # sleep until we need to send again
             self.done.wait(1 / self.config.d2c_operations_per_second)
 
-    def update_thief_properties_thread(self):
+    def update_thief_properties_thread(self, worker_thread_info):
         """
         Thread which occasionally sends reported properties with information about how the
         test is progressing
@@ -237,6 +242,7 @@ class DeviceApp(app_base.AppBase):
         done = False
 
         while not done:
+            worker_thread_info.watchdog_time = time.time()
             # setting this at the begining and checking at the end guarantees one last update
             # before the thread dies
             if self.done.isSet():
@@ -250,7 +256,7 @@ class DeviceApp(app_base.AppBase):
 
             self.done.wait(self.config.thief_property_update_interval)
 
-    def dispatch_c2d_thread(self):
+    def dispatch_c2d_thread(self, worker_thread_info):
         """
         Thread which continuously receives c2d messages throughout the test run.  This
         thread does minimal processing for each c2d.  If anything complex needs to happen as a
@@ -258,6 +264,7 @@ class DeviceApp(app_base.AppBase):
         to pick up.
         """
         while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
             msg = self.client.receive_message(timeout=1)
 
             if msg:
@@ -282,7 +289,7 @@ class DeviceApp(app_base.AppBase):
                                 self.received_pingback_list.append(pingback_id)
                         self.new_pingback_event.set()
 
-    def handle_pingback_thread(self):
+    def handle_pingback_thread(self, worker_thread_info):
         """
         Thread which resolves the pingback_wait_list (messages waiting for pingback) with the
         received_pingback_list (pingbacks that we've received) so we can do pingback callbacks.
@@ -291,6 +298,7 @@ class DeviceApp(app_base.AppBase):
         """
 
         while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
             self.new_pingback_event.clear()
             callbacks = []
 
@@ -313,12 +321,13 @@ class DeviceApp(app_base.AppBase):
 
             self.new_pingback_event.wait(timeout=1)
 
-    def heartbeat_thread(self):
+    def heartbeat_thread(self, worker_thread_info):
         """
         Thread which is responsible for sending heartbeat messages to the other side and
         also for making sure that heartbeat messages are received often enough
         """
         while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
             logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
             msg = Message(
                 json.dumps({"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}})
@@ -352,19 +361,23 @@ class DeviceApp(app_base.AppBase):
         self.update_initial_reported_properties()
 
         # Make a list of threads to launch
-        threads_to_launch = [
-            (self.heartbeat_thread, "heartbeat_thread"),
-            (self.dispatch_c2d_thread, "c2d_dispatch_thread"),
-            (self.update_thief_properties_thread, "update_thief_properties_thread"),
-            (self.handle_pingback_thread, "handle_pingback_thread"),
-            (self.test_d2c_thread, "test_d2c_thead"),
+        worker_thread_infos = [
+            app_base.WorkerThreadInfo(self.heartbeat_thread, "heartbeat_thread"),
+            app_base.WorkerThreadInfo(self.dispatch_c2d_thread, "c2d_dispatch_thread"),
+            app_base.WorkerThreadInfo(
+                self.update_thief_properties_thread, "update_thief_properties_thread"
+            ),
+            app_base.WorkerThreadInfo(self.handle_pingback_thread, "handle_pingback_thread"),
+            app_base.WorkerThreadInfo(self.test_d2c_thread, "test_d2c_thead"),
         ]
         for i in range(0, self.config.d2c_operations_per_second * 2):
-            threads_to_launch.append(
-                (self.send_telemetry_thread, "send_telemetry_thread #{}".format(i))
+            worker_thread_infos.append(
+                app_base.WorkerThreadInfo(
+                    self.send_telemetry_thread, "send_telemetry_thread #{}".format(i)
+                )
             )
 
-        self.run_threads(threads_to_launch)
+        self.run_threads(worker_thread_infos)
 
     def disconnect(self):
         self.client.disconnect()

@@ -14,8 +14,6 @@ from opencensus.trace.tracer import Tracer
 from opencensus.trace.propagation.text_format import TextFormatPropagator
 from opencensus.trace.span_context import SpanContext
 from opencensus.trace.trace_options import TraceOptions
-from opencensus.trace import stack_trace as stack_trace_module
-from opencensus.trace import status as status_module
 import opencensus.log
 
 
@@ -117,35 +115,25 @@ class DependencyTracer(contextlib.AbstractContextManager):
         else:
             self.tracer = Tracer(exporter=log_exporter, sampler=ProbabilitySampler(1.0))
 
-        self.outer_span = self.tracer.start_span(operation_name)
+        self.outer_span = self.tracer.span(operation_name)
+        self.outer_span.__enter__()
         self.span_id = self.outer_span.span_id
 
     def __del__(self):
         self.end_operation()
 
-    def __exit__(self, exception_type, exception_value, traceback):
+    def __exit__(self, *exc_info):
         # so we can use DependencyTracer as a context manager
-        self.end_operation(exception_value, traceback)
+        self.end_operation(*exc_info)
 
     def span(self, name):
         return self.tracer.span(name)
 
-    def end_operation(self, exception_value=None, traceback=None):
+    def end_operation(self, exception_type=None, exception_value=None, traceback=None):
         if self.outer_span:
-            # traceback and exception_value code copied from Span.__exit__.  We'd rather use
-            # a method on the Span object to do this, but we don't have one available.
-            if traceback is not None:
-                self.outer_span.stack_trace = stack_trace_module.StackTrace.from_traceback(
-                    traceback
-                )
-            if exception_value is not None:
-                self.outer_span.status = status_module.Status.from_exception(exception_value)
-
-            self.outer_span.finish()
-            self.tracer.end_span()
-
+            self.outer_span.__exit__(exception_type, exception_value, traceback)
             self.outer_span = None
-            self.tracer = None
+        self.tracer = None
 
     def get_logging_tags(self):
         """

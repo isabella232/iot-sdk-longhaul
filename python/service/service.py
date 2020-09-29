@@ -30,6 +30,7 @@ device_id = os.environ["THIEF_DEVICE_ID"]
 
 log_to_azure_monitor("thief", "service")
 log_to_azure_monitor("azure")
+log_to_azure_monitor("uamqp")
 enable_tracing("service")
 
 
@@ -63,6 +64,7 @@ class ServiceRunConfig(object):
         self.heartbeat_interval = 10
         self.heartbeat_failure_interval = 30
         self.thief_property_update_interval = 60
+        self.watchdog_failure_interval = 300
 
 
 def get_device_id_from_event(event):
@@ -136,7 +138,7 @@ class ServiceApp(app_base.AppBase):
         with self.registry_manager_lock:
             self.registry_manager.update_twin(device_id, twin, "*")
 
-    def eventhub_dispatcher_thread(self):
+    def eventhub_dispatcher_thread(self, worker_thread_info):
         """
         Thread to listen on eventhub for events which are targeted to our device_id
         """
@@ -151,6 +153,7 @@ class ServiceApp(app_base.AppBase):
             logger.warning("on_partition_close: {}".format(reason))
 
         def on_event(partition_context, event):
+            worker_thread_info.watchdog_time = time.time()
             if get_device_id_from_event(event) == device_id:
                 body = event.body_as_json()
                 thief = body.get("thief")
@@ -178,8 +181,9 @@ class ServiceApp(app_base.AppBase):
                 on_partition_close=on_partition_close,
             )
 
-    def c2d_sender_thread(self):
+    def c2d_sender_thread(self, worker_thread_info):
         while not (self.done.isSet() and self.c2d_send_queue.empty()):
+            worker_thread_info.watchdog_time = time.time()
             try:
                 (device_id, message, props) = self.c2d_send_queue.get(timeout=1)
             except queue.Empty:
@@ -213,13 +217,14 @@ class ServiceApp(app_base.AppBase):
                             )
                             raise
 
-    def pingback_thread(self):
+    def pingback_thread(self, worker_thread_info):
         """
         Thread which is responsible for returning pingback response message to the
         device client on the other side of the wall.
         """
 
         while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
             pingback_ids = []
             while True:
                 try:
@@ -255,16 +260,20 @@ class ServiceApp(app_base.AppBase):
 
             time.sleep(1)
 
-    def heartbeat_thread(self):
+    def heartbeat_thread(self, worker_thread_info):
         """
         Thread which is responsible for sending heartbeat messages to the other side and
         also for making sure that heartbeat messages are received often enough
         """
 
         while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
+
             # Don't start sending heartbeats until we receive our first heartbeat from
             # the other side
             if self.first_heartbeat_received.is_set():
+                logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
+
                 message = json.dumps(
                     {"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}}
                 )
@@ -287,7 +296,7 @@ class ServiceApp(app_base.AppBase):
 
             time.sleep(self.config.heartbeat_interval)
 
-    def update_thief_properties_thread(self):
+    def update_thief_properties_thread(self, worker_thread_info):
         """
         Thread which occasionally sends reported properties with information about how the
         test is progressing
@@ -295,6 +304,7 @@ class ServiceApp(app_base.AppBase):
         done = False
 
         while not done:
+            worker_thread_info.watchdog_time = time.time()
             # setting this at the begining and checking at the end guarantees one last update
             # before the thread dies
             if self.done.isSet():
@@ -357,11 +367,15 @@ class ServiceApp(app_base.AppBase):
         )
 
         threads_to_launch = [
-            (self.eventhub_dispatcher_thread, "eventhub_dispatcher_thread"),
-            (self.c2d_sender_thread, "c2d_sender_thread"),
-            (self.pingback_thread, "pingback_thread"),
-            (self.heartbeat_thread, "heartbeat_thread"),
-            (self.update_thief_properties_thread, "update_thief_properties_thread"),
+            app_base.WorkerThreadInfo(
+                self.eventhub_dispatcher_thread, "eventhub_dispatcher_thread"
+            ),
+            app_base.WorkerThreadInfo(self.c2d_sender_thread, "c2d_sender_thread"),
+            app_base.WorkerThreadInfo(self.pingback_thread, "pingback_thread"),
+            app_base.WorkerThreadInfo(self.heartbeat_thread, "heartbeat_thread"),
+            app_base.WorkerThreadInfo(
+                self.update_thief_properties_thread, "update_thief_properties_thread"
+            ),
         ]
 
         self.run_threads(threads_to_launch)
