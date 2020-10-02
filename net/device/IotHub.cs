@@ -34,8 +34,8 @@ namespace Microsoft.Azure.Iot.Thief.Device
         private ConnectionStatusChangeReason _disconnectedReason;
         private volatile DeviceClient _deviceClient;
 
+        private static readonly TimeSpan s_messageLoopSleepTime = TimeSpan.FromSeconds(10);
         private readonly ConcurrentQueue<Message> _messagesToSend = new ConcurrentQueue<Message>();
-        private readonly List<Message> _pendingMessages = new List<Message>();
         private long _totalMessagesSent = 0;
 
         private static readonly JsonSerializerOptions _jsonSerializerOptions = new JsonSerializerOptions { IgnoreNullValues = true };
@@ -79,19 +79,22 @@ namespace Microsoft.Azure.Iot.Thief.Device
         /// <param name="ct">The cancellation token</param>
         public async Task RunAsync(CancellationToken ct)
         {
+            Message pendingMessage = null;
+
             while (!ct.IsCancellationRequested)
             {
-                // Wait when there are few messages to send, or if not connected
-                if (_messagesToSend.Count < 10
-                    || !_isConnected)
+                // Wait when there are no messages to send, or if not connected
+                if (!_isConnected
+                    || !_messagesToSend.Any())
                 {
                     try
                     {
-                        await Task.Delay(60000, ct).ConfigureAwait(false);
+                        await Task.Delay(s_messageLoopSleepTime, ct).ConfigureAwait(false);
                     }
                     catch (TaskCanceledException)
                     {
                         // App is signalled to exit
+                        _logger.Trace($"Exit signal encountered. Terminating telemetry message pump.");
                         return;
                     }
                 }
@@ -101,50 +104,28 @@ namespace Microsoft.Azure.Iot.Thief.Device
                 // If not connected, skip the work below this round
                 if (!_isConnected)
                 {
-                    _logger.Trace($"Waiting for connection before batching telemetry", TraceSeverity.Warning);
+                    _logger.Trace($"Waiting for connection before sending telemetry", TraceSeverity.Warning);
                     continue;
                 }
 
-                // Make a batch of messages to send, unless we're retrying a previous batch
-                if (!_pendingMessages.Any()
-                    && _messagesToSend.Any())
+                // Make get a message to send, unless we're retrying a previous message
+                if (pendingMessage == null)
                 {
-                    int batchSizeBytes = 0;
-
-                    while (_messagesToSend.TryPeek(out Message nextMessage))
-                    {
-                        int nextMessageSize = MessageHelpers.GetMessagePayloadSize(nextMessage);
-                        if (batchSizeBytes + nextMessageSize > MessageHelpers.MaxMessagePayloadBytes)
-                        {
-                            break;
-                        }
-
-                        batchSizeBytes += nextMessageSize;
-                        _messagesToSend.TryDequeue(out Message thisMessage);
-                        _pendingMessages.Add(thisMessage);
-                    }
-
-                    _logger.Metric("MessageBacklog", _messagesToSend.Count);
-                    _logger.Metric("BatchSizeBytes", batchSizeBytes);
+                    _messagesToSend.TryDequeue(out pendingMessage);
                 }
 
-                // Send any messages prepped to send
-                if (_pendingMessages.Any())
+                // Send any message prepped to send
+                if (pendingMessage != null)
                 {
-                    _logger.Metric("PendingMessages", _pendingMessages.Count);
-
                     try
                     {
-                        await _deviceClient.SendEventBatchAsync(_pendingMessages).ConfigureAwait(false);
+                        await _deviceClient.SendEventAsync(pendingMessage, ct).ConfigureAwait(false);
 
-                        _totalMessagesSent += _pendingMessages.Count;
+                        ++_totalMessagesSent;
                         _logger.Metric("TotalMessagesSent", _totalMessagesSent);
 
-                        foreach (var message in _pendingMessages)
-                        {
-                            message.Dispose();
-                        }
-                        _pendingMessages.Clear();
+                        pendingMessage.Dispose();
+                        pendingMessage = null;
                     }
                     catch (IotHubException ex) when (ex.IsTransient)
                     {
@@ -154,13 +135,17 @@ namespace Microsoft.Azure.Iot.Thief.Device
                     {
                         _logger.Trace($"A network-related exception was caught; will retry: {ex}", TraceSeverity.Warning);
                     }
+                    catch (TaskCanceledException)
+                    {
+                        // App is signalled to exit
+                        _logger.Trace($"Exit signal encountered. Terminating telemetry message pump.");
+                        return;
+                    }
                     catch (Exception ex)
                     {
-                        _logger.Trace($"Unknown error batching telemetry: {ex}", TraceSeverity.Critical);
+                        _logger.Trace($"Unknown error sending telemetry: {ex}", TraceSeverity.Critical);
                     }
                 }
-
-                _logger.Metric("PendingMessages", _pendingMessages.Count);
             }
         }
 
