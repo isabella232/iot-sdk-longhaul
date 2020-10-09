@@ -1,2 +1,5 @@
+psutil
 azure-iot-hub >= 2.2.1
 azure-eventhub >= 5.0.1
+opencensus-ext-azure
+opencensus-ext-requests

@@ -11,5 +11,5 @@ COPY service/* /service/
 COPY common/* /common/
 RUN pip install -e common
 
-ENTRYPOINT ["/bin/bash", "/run-service.sh"]
+CMD ["/bin/bash", "/run-service.sh"]
 

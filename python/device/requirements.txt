@@ -1,4 +1,5 @@
-inflection
-opencensus-ext-azure
+psutil
 azure-iot-device >= 2.1.4
+opencensus-ext-azure
+opencensus-ext-requests
 
