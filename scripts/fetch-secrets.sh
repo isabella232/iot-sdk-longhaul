@@ -18,8 +18,20 @@ function get-secret {
     export ${bash_name}=${value}
 }
 
+# This script is intended for developer workstations.  When these tests runs in the cloud,
+# they use a different mechanism to get secrets.
+#
+# Since this is a developer workstation, set the device ID and run IDs so the developer runs
+# all communicate with each other instead of accidentally pairing with service apps that are
+# running in the cloud.
 echo "Setting THIEF_DEVICE_ID"
 export THIEF_DEVICE_ID=${USER}_test_device
+echo "Setting THIEF_DEVICE_APP_RUN_ID"
+export THIEF_DEVICE_APP_RUN_ID=${USER}_device_app_run_id
+echo "Setting THIEF_SERVICE_APP_RUN_ID"
+export THIEF_SERVICE_APP_RUN_ID=${USER}_service_app_run_id
+echo "setting THIEF_REQUESTED_SERVICE_APP_RUN_ID"
+export THIEF_REQUESTED_SERVICE_APP_RUN_ID=${THIEF_SERVICE_APP_RUN_ID}
 
 get-secret THIEF_SERVICE_CONNECTION_STRING THIEF-SERVICE-CONNECTION-STRING
 get-secret THIEF_DEVICE_PROVISIONING_HOST THIEF-DEVICE-PROVISIONING-HOST

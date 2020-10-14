@@ -9,7 +9,7 @@ import datetime
 import sys
 import platform
 import os
-import psutil
+from system_health_telemetry import SystemHealthTelemetry
 
 
 logger = logging.getLogger("thief.{}".format(__name__))
@@ -34,6 +34,9 @@ class WorkerThreadInfo(object):
 
 @six.add_metaclass(abc.ABCMeta)
 class AppBase(object):
+    def __init__(self):
+        self.system_health_telemetry = SystemHealthTelemetry()
+
     @abc.abstractmethod
     def disconnect(self):
         pass
@@ -53,27 +56,14 @@ class AppBase(object):
             "osRelease": platform.version(),
         }
 
-    def get_variable_system_metrics(self):
-        try:
-            process = self.process
-        except AttributeError:
-            self.process = psutil.Process(os.getpid())
-            process = self.process
+    def get_system_health_telemetry(self):
         props = {
-            "processCpuUtilization": process.cpu_percent(),
+            "processCpuPercent": self.system_health_telemetry.process_cpu_percent,
+            "processWorkingSet": self.system_health_telemetry.process_working_set,
+            "processBytesInAllHeaps": self.system_health_telemetry.process_bytes_in_all_heaps,
+            "processPrivateBytes": self.system_health_telemetry.process_private_bytes,
+            "processWorkingSetPrivate": self.system_health_telemetry.process_working_set_private,
         }
-        system = platform.system()
-        memory_info = process.memory_info()
-        if system == "Linux":
-            # from /proc/{pid}/statm - equal to (VmRSS - (RssFile+RssShmem)) from /proc/{pid}/status
-            props["processPrivateMemoryKb"] = (memory_info.rss - memory_info.shared) / 1024
-        elif system == "Windows":
-            # from SYSTEM_PROCESS_INFORMATION.PrivatePageCount
-            props["processPrivateMemoryKb"] = memory_info.pivate / 1024
-        else:
-            # fallback.  includes libraries and shared memory.
-            props["processResidentMemoryKb"] = memory_info.rss / 1024
-
         return props
 
     def run_threads(self, threads_to_launch):

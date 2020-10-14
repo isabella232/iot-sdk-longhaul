@@ -9,28 +9,35 @@ import threading
 import json
 import datetime
 import app_base
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub.models import Twin, TwinProperties
 from azure.eventhub import EventHubConsumerClient
 from azure_monitor import get_event_logger, log_to_azure_monitor
 from measurement import ThreadSafeCounter
-import azure.iot.hub.constant
 
 logger = logging.getLogger("thief.{}".format(__name__))
 event_logger = get_event_logger("service")
 
 logging.basicConfig(level=logging.WARNING)
-logging.getLogger("thief").setLevel(level=logging.INFO)
+logging.getLogger("thief").setLevel(level=logging.DEBUG)
 
+# use os.environ[] for required environment variables
 iothub_connection_string = os.environ["THIEF_SERVICE_CONNECTION_STRING"]
 eventhub_connection_string = os.environ["THIEF_EVENTHUB_CONNECTION_STRING"]
 eventhub_consumer_group = os.environ["THIEF_EVENTHUB_CONSUMER_GROUP"]
-device_id = os.environ["THIEF_DEVICE_ID"]
+
+# use os.getenv() for optional environment variables
+run_id = os.getenv("THIEF_SERVICE_APP_RUN_ID")
 
 log_to_azure_monitor("thief", "service")
 log_to_azure_monitor("azure")
 log_to_azure_monitor("uamqp")
+
+
+if not run_id:
+    run_id = str(uuid.uuid4())
 
 
 class ServiceRunMetrics(object):
@@ -45,9 +52,6 @@ class ServiceRunMetrics(object):
         self.run_state = app_base.WAITING
         self.exit_reason = None
 
-        self.heartbeats_sent = ThreadSafeCounter()
-        self.heartbeats_received = ThreadSafeCounter()
-
         self.pingback_requests_received = ThreadSafeCounter()
         self.pingback_responses_sent = ThreadSafeCounter()
 
@@ -60,8 +64,6 @@ class ServiceRunConfig(object):
     def __init__(self):
         self.max_run_duration = 0
 
-        self.heartbeat_interval = 10
-        self.heartbeat_failure_interval = 300
         self.thief_property_update_interval = 60
         self.watchdog_failure_interval = 300
 
@@ -76,6 +78,8 @@ class ServiceApp(app_base.AppBase):
     """
 
     def __init__(self):
+        super(ServiceApp, self).__init__()
+
         self.executor = ThreadPoolExecutor(max_workers=128)
         self.done = threading.Event()
         self.registry_manager_lock = threading.Lock()
@@ -85,61 +89,113 @@ class ServiceApp(app_base.AppBase):
         self.metrics = ServiceRunMetrics()
         self.config = ServiceRunConfig()
 
+        self.paired_device_ids = []
+
         # for any kind of c2d
         self.c2d_send_queue = queue.Queue()
 
-        # futor pingbacks
+        # for pingbacks
         self.pingback_events = queue.Queue()
         self.pingback_events_lock = threading.Lock()
 
-        # for heartbeats
-        self.last_heartbeat = time.time()
-        self.next_heartbeat_id = 10000
-        self.first_heartbeat_received = threading.Event()
+        # for bootstrapping
+        self.bootstrap_queue = queue.Queue()
 
-    def get_longhaul_metrics(self):
-        self.metrics.run_time = (
-            datetime.datetime.now(datetime.timezone.utc) - self.metrics.run_start_utc
-        )
+    def do_bootstrap_device(self, event):
+        device_id = get_device_id_from_event(event)
+        logger.debug("queueing bootstrap for device {}".format(device_id))
+        self.bootstrap_queue.put(event)
 
-        props = {
-            "runStartUtc": self.metrics.run_start_utc.isoformat(),
-            "runEndUtc": self.metrics.run_end_utc.isoformat() if self.metrics.run_end_utc else None,
-            "runTime": str(self.metrics.run_time),
-            "runState": str(self.metrics.run_state),
-            "exitReason": self.metrics.exit_reason,
-            "heartbeats": {
-                "sent": self.metrics.heartbeats_sent.get_count(),
-                "received": self.metrics.heartbeats_received.get_count(),
-            },
-            "pingbacks": {
-                "requestsReceived": self.metrics.pingback_requests_received.get_count(),
-                "responsesSent": self.metrics.pingback_responses_sent.get_count(),
-            },
-        }
-        return props
-
-    def update_initial_reported_properties(self):
+    def bootstrapper_thread(self, worker_thread_info):
         """
-        Update reported properties at the start of a run
+        Thread responsible for responding to bootstrap requests from devices.
+        The bootstrap handshake is documented in device.py inside the
+        `pair_with_service_instance` function.
+
+        This functionality lives in it's own thread because it involves some
+        back-and-forth communication with the device, and this can take a while.
+        Since this can happen any time, we don't want to block any other functionality
+        while we do this.
         """
 
-        props = {"thief": {"service": self.get_longhaul_metrics()}}
-        props["thief"]["service"].update(
-            self.get_fixed_system_metrics(azure.iot.hub.constant.VERSION)
-        )
-        props["thief"]["service"].update(self.get_variable_system_metrics())
+        while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
 
-        twin = Twin()
-        twin.properties = TwinProperties(desired=props)
+            try:
+                event = self.bootstrap_queue.get_nowait()
+            except queue.Empty:
+                event = None
 
-        logger.info("Setting initial thief properties: {}".format(twin.properties))
-        with self.registry_manager_lock:
-            self.registry_manager.update_twin(device_id, twin, "*")
+            device_id = get_device_id_from_event(event) if event else None
+            if device_id:
+                logger.info("bootstrapper thread bootstrapping device {}".format(device_id))
+                # If we get a bootstrap request from a device, get the twin to see what
+                # it wants.
+                with self.registry_manager_lock:
+                    twin = self.registry_manager.get_twin(device_id)
+                if (
+                    "thief" in twin.properties.reported
+                    and "device" in twin.properties.reported["thief"]
+                ):
+                    device = twin.properties.reported["thief"]
+
+                    # check to see if the device already selected a difference service app.
+                    # if so, we don't need to continue.
+                    if device.get("serviceAppRunId", None):
+                        logger.info(
+                            "device {} already using serviceAppRunId {}".format(
+                                device_id, device["serviceAppRunId"]
+                            )
+                        )
+                    else:
+                        # Maybe the device app wants a specific service app.  If we're not that
+                        # instance, we can stop.
+                        requested_service_run_app_id = device.get("requestedServiceAppRunId", None)
+                        if requested_service_run_app_id and requested_service_run_app_id != run_id:
+                            logger.info(
+                                "device {} requesting different service app: {}".format(
+                                    device_id, device["requestedServiceAppRunId"]
+                                )
+                            )
+                        else:
+                            # the device is either asking for us specifically, or it doesn't care what service app it uses.
+                            # Set the serviceAppRunId desired property to tell the device that we're availble.
+                            # Maybe it will choose us, maybe it won't
+                            twin = Twin()
+                            twin.properties = TwinProperties(
+                                desired={"thief": {"device": {"serviceAppRunId": run_id}}}
+                            )
+                            logger.info(
+                                "Setting twin properties to set serviceAppRunId for {}: {}".format(
+                                    device_id, twin.properties
+                                )
+                            )
+                            with self.registry_manager_lock:
+                                self.registry_manager.update_twin(device_id, twin, "*")
+
+                            # At this point, maybe the device uses us, or maybe it uses someone else.
+                            # Either way, we don't care.  If we start seeing messages from the device
+                            # that tag us, we'll respond.
+
+                            # In the future, we could look at the device's reported properties to
+                            # see if it chose us, but there's no reason to do this yet.
+                else:
+                    logger.warning(
+                        "trying to bootstrap with invalid device twin {}: {}".format(
+                            device_id, twin
+                        )
+                    )
+            else:
+                # nothing left in the queue.  wait a second and try again.
+                # note: If we just handled a device_id, we don't sleep because there might be
+                # something left in the queue.
+                time.sleep(1)
 
     def eventhub_dispatcher_thread(self, worker_thread_info):
         """
-        Thread to listen on eventhub for events which are targeted to our device_id
+        Thread to listen on eventhub for events that we can handle.  Right now, we service
+        events on all partitions, but we could restrict this and have one (or more) service app(s)
+        per partition.
         """
 
         def on_error(partition_context, error):
@@ -153,23 +209,21 @@ class ServiceApp(app_base.AppBase):
 
         def on_event(partition_context, event):
             worker_thread_info.watchdog_time = time.time()
-            if get_device_id_from_event(event) == device_id:
-                body = event.body_as_json()
-                thief = body.get("thief")
-                cmd = thief.get("cmd") if thief else None
+            body = event.body_as_json()
+            thief = body.get("thief")
+            cmd = thief.get("cmd") if thief else None
 
-                if cmd == "heartbeat":
-                    logger.info(
-                        "heartbeat received.  heartbeatId={}".format(thief.get("heartbeatId"))
-                    )
-                    self.last_heartbeat = time.time()
-                    self.metrics.heartbeats_received.increment()
-                    if not self.first_heartbeat_received.isSet():
-                        self.first_heartbeat_received.set()
+            device_id = get_device_id_from_event(event)
+            if cmd == "bootstrap":
+                logger.debug("Got bootstrap command for device {}".format(device_id))
+                self.do_bootstrap_device(event)
 
-                elif cmd == "pingback":
+            elif event.properties.get(b"serviceAppRunId", b"").decode("utf-8") == run_id:
+                if cmd == "pingback":
                     with self.pingback_events_lock:
                         self.pingback_events.put(event)
+                else:
+                    logger.info("Unknown command received from {}: {}".format(device_id, body))
 
         logger.info("starting receive")
         with self.eventhub_consumer_client:
@@ -225,125 +279,49 @@ class ServiceApp(app_base.AppBase):
 
         while not self.done.isSet():
             worker_thread_info.watchdog_time = time.time()
-            pingback_ids = []
+            pingback_ids = {}
             while True:
                 try:
                     event = self.pingback_events.get_nowait()
                 except queue.Empty:
                     break
+                device_id = get_device_id_from_event(event)
                 thief = event.body_as_json()["thief"]
-                pingback_ids.append(thief["pingbackId"])
+                pingback_id = thief["pingbackId"]
+                if device_id not in pingback_ids:
+                    pingback_ids[device_id] = []
+                pingback_ids[device_id].append(pingback_id)
+
                 self.metrics.pingback_requests_received.increment()
 
             if len(pingback_ids):
-                logger.debug("send pingback for {}".format(pingback_ids))
-
-                message = json.dumps(
-                    {"thief": {"cmd": "pingbackResponse", "pingbackIds": pingback_ids}}
-                )
-
-                self.c2d_send_queue.put(
-                    (
-                        device_id,
-                        message,
-                        {"contentType": "application/json", "contentEncoding": "utf-8"},
+                for device_id in pingback_ids:
+                    logger.debug(
+                        "send pingback for device_id = {}: {}".format(
+                            device_id, pingback_ids[device_id]
+                        )
                     )
-                )
 
-                self.metrics.pingback_responses_sent.increment()
+                    message = json.dumps(
+                        {
+                            "thief": {
+                                "cmd": "pingbackResponse",
+                                "pingbackIds": pingback_ids[device_id],
+                            }
+                        }
+                    )
+
+                    self.c2d_send_queue.put(
+                        (
+                            device_id,
+                            message,
+                            {"contentType": "application/json", "contentEncoding": "utf-8"},
+                        )
+                    )
+
+                    self.metrics.pingback_responses_sent.increment()
 
             time.sleep(1)
-
-    def heartbeat_thread(self, worker_thread_info):
-        """
-        Thread which is responsible for sending heartbeat messages to the other side and
-        also for making sure that heartbeat messages are received often enough
-        """
-
-        while not self.done.isSet():
-            worker_thread_info.watchdog_time = time.time()
-
-            # Don't start sending heartbeats until we receive our first heartbeat from
-            # the other side
-            if self.first_heartbeat_received.is_set():
-                logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
-
-                message = json.dumps(
-                    {"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}}
-                )
-
-                self.c2d_send_queue.put(
-                    (
-                        device_id,
-                        message,
-                        {"contentType": "application/json", "contentEncoding": "utf-8"},
-                    )
-                )
-                self.next_heartbeat_id += 1
-                self.metrics.heartbeats_sent.increment()
-
-            seconds_since_last_heartbeat = time.time() - self.last_heartbeat
-            if seconds_since_last_heartbeat > self.config.heartbeat_failure_interval:
-                raise Exception(
-                    "No heartbeat received for {} seconds".format(seconds_since_last_heartbeat)
-                )
-
-            time.sleep(self.config.heartbeat_interval)
-
-    def update_thief_properties_thread(self, worker_thread_info):
-        """
-        Thread which occasionally sends reported properties with information about how the
-        test is progressing
-        """
-        done = False
-
-        while not done:
-            worker_thread_info.watchdog_time = time.time()
-            # setting this at the begining and checking at the end guarantees one last update
-            # before the thread dies
-            if self.done.isSet():
-                done = True
-
-            props = {"thief": {"service": self.get_longhaul_metrics()}}
-            props["thief"]["service"].update(self.get_variable_system_metrics())
-
-            twin = Twin()
-            twin.properties = TwinProperties(desired=props)
-
-            logger.info("Updating thief properties: {}".format(twin.properties))
-            with self.registry_manager_lock:
-                self.registry_manager.update_twin(device_id, twin, "*")
-
-            self.done.wait(self.config.thief_property_update_interval)
-
-    def wait_for_device_creation(self):
-        """
-        Make sure our device exists before we continue.  Since the device app and this
-        app are both starting up around the same time, it's possible that the device app
-        hasn't used DPS to crate the device yet.  Give up after 60 seconds
-        """
-        start_time = time.time()
-        device = None
-        while not device and (time.time() - start_time) < 60:
-            try:
-                with self.registry_manager_lock:
-                    device = self.registry_manager.get_device(device_id)
-            except Exception as e:
-                logger.info("get_device returned: {}".format(e))
-                try:
-                    if e.response.status_code == 404:
-                        # a 404.  sleep and try again
-                        logger.info("Sleeping for 10 seconds before trying again")
-                        time.sleep(10)
-                    else:
-                        # not a 404.  Raise it.
-                        raise e
-                except AttributeError:
-                    # an AttributeError means this wasn't an msrest error.  raise it.
-                    raise e
-
-        if not device:
-            raise Exception("Device does not exist.  Cannot continue")
 
     def main(self):
 
@@ -353,9 +331,6 @@ class ServiceApp(app_base.AppBase):
         with self.registry_manager_lock:
             self.registry_manager = IoTHubRegistryManager(iothub_connection_string)
 
-        self.wait_for_device_creation()
-        self.update_initial_reported_properties()
-
         self.eventhub_consumer_client = EventHubConsumerClient.from_connection_string(
             eventhub_connection_string, consumer_group=eventhub_consumer_group
         )
@@ -364,12 +339,9 @@ class ServiceApp(app_base.AppBase):
             app_base.WorkerThreadInfo(
                 self.eventhub_dispatcher_thread, "eventhub_dispatcher_thread"
             ),
+            app_base.WorkerThreadInfo(self.bootstrapper_thread, "bootstrapper_thread"),
             app_base.WorkerThreadInfo(self.c2d_sender_thread, "c2d_sender_thread"),
             app_base.WorkerThreadInfo(self.pingback_thread, "pingback_thread"),
-            app_base.WorkerThreadInfo(self.heartbeat_thread, "heartbeat_thread"),
-            app_base.WorkerThreadInfo(
-                self.update_thief_properties_thread, "update_thief_properties_thread"
-            ),
         ]
 
         self.run_threads(threads_to_launch)

@@ -23,17 +23,30 @@ event_logger = get_event_logger("device")
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("paho").setLevel(level=logging.DEBUG)
-logging.getLogger("thief").setLevel(level=logging.INFO)
+logging.getLogger("thief").setLevel(level=logging.DEBUG)
 
 
+# use os.environ[] for required environment variables
 provisioning_host = os.environ["THIEF_DEVICE_PROVISIONING_HOST"]
 id_scope = os.environ["THIEF_DEVICE_ID_SCOPE"]
 group_symmetric_key = os.environ["THIEF_DEVICE_GROUP_SYMMETRIC_KEY"]
 registration_id = os.environ["THIEF_DEVICE_ID"]
 
+# use os.getenv() for optional environment variables
+run_id = os.getenv("THIEF_DEVICE_APP_RUN_ID")
+requested_service_app_run_id = os.getenv("THIEF_REQUESTED_SERVICE_APP_RUN_ID")
+
+# Amount of time to wait for a service app to "claim" this device
+BOOTSTRAP_TIMEOUT_INTERVAL = 300
+# Amount of time before resending bootstrap command
+BOOTSTRAP_SEND_INTERVAL = 30
+
 log_to_azure_monitor("thief", "device")
 log_to_azure_monitor("azure")
 log_to_azure_monitor("paho")
+
+if not run_id:
+    run_id = str(uuid.uuid4())
 
 
 class DeviceRunMetrics(object):
@@ -48,12 +61,8 @@ class DeviceRunMetrics(object):
         self.run_state = app_base.WAITING
         self.exit_reason = None
 
-        self.heartbeats_sent = ThreadSafeCounter()
-        self.heartbeats_received = ThreadSafeCounter()
-
         self.pingback_requests_sent = ThreadSafeCounter()
         self.pingback_responses_received = ThreadSafeCounter()
-
         self.d2c_in_flight = ThreadSafeCounter()
         self.d2c_sent = ThreadSafeCounter()
         self.d2c_acknowledged = ThreadSafeCounter()
@@ -69,8 +78,6 @@ class DeviceRunConfig(object):
     def __init__(self):
         self.max_run_duration = 0
 
-        self.heartbeat_interval = 10
-        self.heartbeat_failure_interval = 300
         self.thief_property_update_interval = 60
         self.watchdog_failure_interval = 300
 
@@ -86,20 +93,19 @@ class DeviceApp(app_base.AppBase):
     """
 
     def __init__(self):
+        super(DeviceApp, self).__init__()
+
         self.executor = ThreadPoolExecutor(max_workers=128)
         self.done = threading.Event()
         self.client = None
         self.metrics = DeviceRunMetrics()
         self.config = DeviceRunConfig()
+        self.service_app_run_id = None
         # for pingbacks
         self.pingback_list_lock = threading.Lock()
         self.pingback_wait_list = {}
         self.received_pingback_list = []
         self.new_pingback_event = threading.Event()
-        # for heartbeats
-        self.next_heartbeat_id = 0
-        self.last_heartbeat = time.time()
-        self.first_heartbeat_received = threading.Event()
         # for telemetry
         self.telemetry_queue = queue.Queue()
 
@@ -114,10 +120,6 @@ class DeviceApp(app_base.AppBase):
             "runTime": str(self.metrics.run_time),
             "runState": str(self.metrics.run_state),
             "exitReason": self.metrics.exit_reason,
-            "heartbeats": {
-                "sent": self.metrics.heartbeats_sent.get_count(),
-                "received": self.metrics.heartbeats_received.get_count(),
-            },
             "pingbacks": {
                 "requestsSent": self.metrics.pingback_requests_sent.get_count(),
                 "responsesReceived": self.metrics.pingback_responses_received.get_count(),
@@ -139,10 +141,79 @@ class DeviceApp(app_base.AppBase):
         props["thief"]["device"].update(
             self.get_fixed_system_metrics(azure.iot.device.constant.VERSION)
         )
-        props["thief"]["device"].update(self.get_variable_system_metrics())
-
         print("patching {}".format(props))
         self.client.patch_twin_reported_properties(props)
+
+    def pair_with_service_instance(self):
+        """
+        "pair" with a service app. This is necessary because we can have a single
+        service app responsible for multiple device apps.  The pairing process works
+        like this:
+        1. The device sets reported properties saying it doesn't have a service app
+            and any preferernces it has about what service app resopnds.  (currently, it
+            can specify the exact service app using the service app's run ID, but we may add
+            more preferences later.)
+        2. The device app sends a "bootstrap" d2c message.
+        3. All service apps watch for all "bootstrap" messages.  If some service app instance
+            wants to get paired with a device, it sets a desired property to indicate that it's
+            available.  If multiple service apps set the property, the winner is chosen by the
+            device app, probably based on whatever value happens to be in the desired property
+            when the device app checks.
+        4. Once the device decides on a service app, it sets it's serviceAppRunId reported
+            property. It also sets the serviceAppRunId property in any telemetry messages it
+            sends.
+
+        Right now, there is no provision for a failing service app.  In the future, the device
+        code _could_ see that the service app isn't responding and start the bootstrap process
+        over again.
+        """
+
+        reported_properties = {
+            "thief": {
+                "device": {
+                    "serviceAppRunId": None,
+                    "requestedServiceAppRunId": requested_service_app_run_id,
+                }
+            }
+        }
+        logger.debug(
+            "Attempting to pair with service instance.  Setting reported properties: {}".format(
+                reported_properties
+            )
+        )
+        self.client.patch_twin_reported_properties(reported_properties)
+
+        logger.debug("sending bootstrap message")
+        bootstrap_message = Message(json.dumps({"thief": {"cmd": "bootstrap"}}))
+        bootstrap_message.content_type = "application/json"
+        bootstrap_message.content_encoding = "utf-8"
+        self.client.send_message(bootstrap_message)
+
+        start_time = time.time()
+        while time.time() - start_time < BOOTSTRAP_TIMEOUT_INTERVAL:
+            logger.debug("Waiting for service app to claim this device")
+            patch = self.client.receive_twin_desired_properties_patch(
+                timeout=BOOTSTRAP_SEND_INTERVAL
+            )
+
+            if patch and "thief" in patch and "device" in patch["thief"]:
+                logger.debug("Got patch")
+                service_app_run_id = patch["thief"]["device"].get("serviceAppRunId", None)
+                if service_app_run_id:
+                    logger.debug(
+                        "Service app {} claimed this device instance".format(service_app_run_id)
+                    )
+                    self.service_app_run_id = service_app_run_id
+                    reported_properties["thief"]["device"]["serviceAppRunId"] = service_app_run_id
+                    self.client.patch_twin_reported_properties(reported_properties)
+                    return
+                else:
+                    logger.debug("patch received, but serviceAppRunId not set: {}".format(patch))
+
+            logger.debug("Still no assigned service instance. Sending new bootstrap message")
+            self.client.send_message(bootstrap_message)
+
+        raise Exception("timeout waitig for service to set serviceAppRunId")
 
     def send_telemetry_thread(self, worker_thread_info):
         """
@@ -183,10 +254,6 @@ class DeviceApp(app_base.AppBase):
         send_telemetry_thread instance to actually send the message.
         """
 
-        # Don't start sending until we know that there's a service app on the other side.
-        while not (self.first_heartbeat_received.isSet() or self.done.isSet()):
-            self.first_heartbeat_received.wait(1)
-
         while not self.done.isSet():
             worker_thread_info.watchdog_time = time.time()
 
@@ -199,7 +266,9 @@ class DeviceApp(app_base.AppBase):
                     "device": self.get_longhaul_metrics(),
                 }
             }
-            props["thief"]["device"].update(self.get_variable_system_metrics())
+            props["thief"]["device"].update(self.get_system_health_telemetry())
+
+            # TODO: this is where we push metrics to Azure monitor
 
             msg = Message(json.dumps(props))
             msg.content_type = "application/json"
@@ -207,6 +276,7 @@ class DeviceApp(app_base.AppBase):
             msg.custom_properties["eventDateTimeUtc"] = datetime.datetime.now(
                 datetime.timezone.utc
             ).isoformat()
+            msg.custom_properties["serviceAppRunId"] = self.service_app_run_id
 
             def on_pingback_received(pingback_id):
                 self.metrics.d2c_acknowledged.increment()
@@ -236,7 +306,6 @@ class DeviceApp(app_base.AppBase):
                 done = True
 
             props = {"thief": {"device": self.get_longhaul_metrics()}}
-            props["thief"]["device"].update(self.get_variable_system_metrics())
 
             logger.info("updating thief props: {}".format(props))
             self.client.patch_twin_reported_properties(props)
@@ -258,16 +327,7 @@ class DeviceApp(app_base.AppBase):
                 obj = json.loads(msg.data.decode())
                 thief = obj.get("thief")
                 cmd = thief.get("cmd") if thief else None
-                if cmd == "heartbeat":
-                    logger.info(
-                        "heartbeat received.  heartbeatId={}".format(thief.get("heartbeatId"))
-                    )
-                    self.last_heartbeat = time.time()
-                    self.metrics.heartbeats_received.increment()
-                    if not self.first_heartbeat_received.isSet():
-                        self.first_heartbeat_received.set()
-
-                elif cmd == "pingbackResponse":
+                if cmd == "pingbackResponse":
                     self.metrics.pingback_responses_received.increment()
                     list = thief.get("pingbackIds")
                     if list:
@@ -275,6 +335,8 @@ class DeviceApp(app_base.AppBase):
                             for pingback_id in list:
                                 self.received_pingback_list.append(pingback_id)
                         self.new_pingback_event.set()
+                else:
+                    logger.warning("Unknown command received: {}".format(obj))
 
     def handle_pingback_thread(self, worker_thread_info):
         """
@@ -308,31 +370,6 @@ class DeviceApp(app_base.AppBase):
 
             self.new_pingback_event.wait(timeout=1)
 
-    def heartbeat_thread(self, worker_thread_info):
-        """
-        Thread which is responsible for sending heartbeat messages to the other side and
-        also for making sure that heartbeat messages are received often enough
-        """
-        while not self.done.isSet():
-            worker_thread_info.watchdog_time = time.time()
-            logger.info("sending heartbeat with id {}".format(self.next_heartbeat_id))
-            msg = Message(
-                json.dumps({"thief": {"cmd": "heartbeat", "heartbeatId": self.next_heartbeat_id}})
-            )
-            self.next_heartbeat_id += 1
-            msg.content_type = "application/json"
-            msg.content_encoding = "utf-8"
-            self.client.send_message(msg)
-            self.metrics.heartbeats_sent.increment()
-
-            seconds_since_last_heartbeat = time.time() - self.last_heartbeat
-            if seconds_since_last_heartbeat > self.config.heartbeat_failure_interval:
-                raise Exception(
-                    "No heartbeat received for {} seconds".format(seconds_since_last_heartbeat)
-                )
-
-            time.sleep(self.config.heartbeat_interval)
-
     def main(self):
 
         self.metrics.run_start_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -347,9 +384,11 @@ class DeviceApp(app_base.AppBase):
         )
         self.update_initial_reported_properties()
 
+        # pair with a service app instance
+        self.pair_with_service_instance()
+
         # Make a list of threads to launch
         worker_thread_infos = [
-            app_base.WorkerThreadInfo(self.heartbeat_thread, "heartbeat_thread"),
             app_base.WorkerThreadInfo(self.dispatch_c2d_thread, "c2d_dispatch_thread"),
             app_base.WorkerThreadInfo(
                 self.update_thief_properties_thread, "update_thief_properties_thread"
