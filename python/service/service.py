@@ -13,15 +13,17 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from azure.iot.hub import IoTHubRegistryManager
 from azure.iot.hub.models import Twin, TwinProperties
+import azure.iot.hub.constant
 from azure.eventhub import EventHubConsumerClient
-from azure_monitor import get_event_logger, log_to_azure_monitor
+import azure_monitor
 from measurement import ThreadSafeCounter
+from azure.iot.device.common.auth import connection_string
 
-logger = logging.getLogger("thief.{}".format(__name__))
-event_logger = get_event_logger("service")
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("thief").setLevel(level=logging.DEBUG)
+
+logger = logging.getLogger("thief.{}".format(__name__))
 
 # use os.environ[] for required environment variables
 iothub_connection_string = os.environ["THIEF_SERVICE_CONNECTION_STRING"]
@@ -31,13 +33,22 @@ eventhub_consumer_group = os.environ["THIEF_EVENTHUB_CONSUMER_GROUP"]
 # use os.getenv() for optional environment variables
 run_id = os.getenv("THIEF_SERVICE_APP_RUN_ID")
 
-log_to_azure_monitor("thief", "service")
-log_to_azure_monitor("azure")
-log_to_azure_monitor("uamqp")
-
-
 if not run_id:
     run_id = str(uuid.uuid4())
+
+cs = connection_string.ConnectionString(iothub_connection_string)
+
+# configure our traces and events to go to Azure Monitor
+azure_monitor.configure_logging(
+    client_type="service",
+    run_id=run_id,
+    hub=cs["HostName"],
+    sdk_version=azure.iot.hub.constant.VERSION,
+)
+event_logger = azure_monitor.get_event_logger()
+azure_monitor.log_to_azure_monitor("thief")
+azure_monitor.log_to_azure_monitor("azure")
+azure_monitor.log_to_azure_monitor("uamqp")
 
 
 class ServiceRunMetrics(object):
@@ -133,28 +144,25 @@ class ServiceApp(app_base.AppBase):
                 # it wants.
                 with self.registry_manager_lock:
                     twin = self.registry_manager.get_twin(device_id)
-                if (
-                    "thief" in twin.properties.reported
-                    and "device" in twin.properties.reported["thief"]
-                ):
-                    device = twin.properties.reported["thief"]
+                if "thief" in twin.properties.reported:
+                    thief = twin.properties.reported["thief"]
 
                     # check to see if the device already selected a difference service app.
                     # if so, we don't need to continue.
-                    if device.get("serviceAppRunId", None):
+                    if thief.get("serviceAppRunId", None):
                         logger.info(
                             "device {} already using serviceAppRunId {}".format(
-                                device_id, device["serviceAppRunId"]
+                                device_id, thief["serviceAppRunId"]
                             )
                         )
                     else:
                         # Maybe the device app wants a specific service app.  If we're not that
                         # instance, we can stop.
-                        requested_service_run_app_id = device.get("requestedServiceAppRunId", None)
+                        requested_service_run_app_id = thief.get("requestedServiceAppRunId", None)
                         if requested_service_run_app_id and requested_service_run_app_id != run_id:
                             logger.info(
                                 "device {} requesting different service app: {}".format(
-                                    device_id, device["requestedServiceAppRunId"]
+                                    device_id, thief["requestedServiceAppRunId"]
                                 )
                             )
                         else:
@@ -163,7 +171,7 @@ class ServiceApp(app_base.AppBase):
                             # Maybe it will choose us, maybe it won't
                             twin = Twin()
                             twin.properties = TwinProperties(
-                                desired={"thief": {"device": {"serviceAppRunId": run_id}}}
+                                desired={"thief": {"serviceAppRunId": run_id}}
                             )
                             logger.info(
                                 "Setting twin properties to set serviceAppRunId for {}: {}".format(

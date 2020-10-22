@@ -1,4 +1,4 @@
-# ( Copyright (c) Microsoft. All rights reserved.
+# Copyright (c) Microsoft. All rights reserved.
 # Licensed under the MIT license. See LICENSE file in the project root for
 # full license information.
 import logging
@@ -15,15 +15,14 @@ import app_base
 from azure.iot.device import Message
 import azure.iot.device.constant
 from measurement import ThreadSafeCounter
-from azure_monitor import get_event_logger, log_to_azure_monitor
-
-
-logger = logging.getLogger("thief.{}".format(__name__))
-event_logger = get_event_logger("device")
+import azure_monitor
+from azure_monitor_metrics import MetricsReporter
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("paho").setLevel(level=logging.DEBUG)
 logging.getLogger("thief").setLevel(level=logging.DEBUG)
+
+logger = logging.getLogger("thief.{}".format(__name__))
 
 
 # use os.environ[] for required environment variables
@@ -41,12 +40,18 @@ BOOTSTRAP_TIMEOUT_INTERVAL = 300
 # Amount of time before resending bootstrap command
 BOOTSTRAP_SEND_INTERVAL = 30
 
-log_to_azure_monitor("thief", "device")
-log_to_azure_monitor("azure")
-log_to_azure_monitor("paho")
-
 if not run_id:
     run_id = str(uuid.uuid4())
+
+
+# configure our traces and events to go to Azure Monitor
+azure_monitor.configure_logging(
+    client_type="device", run_id=run_id, sdk_version=azure.iot.device.constant.VERSION,
+)
+event_logger = azure_monitor.get_event_logger()
+azure_monitor.log_to_azure_monitor("thief")
+azure_monitor.log_to_azure_monitor("azure")
+azure_monitor.log_to_azure_monitor("paho")
 
 
 class DeviceRunMetrics(object):
@@ -98,6 +103,8 @@ class DeviceApp(app_base.AppBase):
         self.executor = ThreadPoolExecutor(max_workers=128)
         self.done = threading.Event()
         self.client = None
+        self.hub = None
+        self.device_id = None
         self.metrics = DeviceRunMetrics()
         self.config = DeviceRunConfig()
         self.service_app_run_id = None
@@ -108,11 +115,79 @@ class DeviceApp(app_base.AppBase):
         self.new_pingback_event = threading.Event()
         # for telemetry
         self.telemetry_queue = queue.Queue()
+        # for metrics
+        self.reporter = MetricsReporter()
+        self._configure_azure_monitor_metrics()
+
+    def _configure_azure_monitor_metrics(self):
+        self.reporter.add_float_measurement(
+            "process_cpu_percent",
+            "processCpuPercent",
+            "Amount of CPU usage by the process",
+            "percentage",
+        )
+        self.reporter.add_integer_measurement(
+            "process_working_set",
+            "processWorkingSet",
+            "All physical memory used by the process",
+            "bytes",
+        )
+        self.reporter.add_integer_measurement(
+            "process_bytes_in_all_heaps",
+            "processBytesInAllHeaps",
+            "All virtual memory used by the process",
+            "bytes",
+        )
+        self.reporter.add_integer_measurement(
+            "process_private_bytes",
+            "processPrivateBytes",
+            "Amount of non-shared physical memory used by the process",
+            "bytes",
+        )
+        self.reporter.add_integer_measurement(
+            "process_working_set_private",
+            "processWorkingSetPrivate",
+            "Amount of non-shared physical memory used by the process",
+            "bytes",
+        )
+        self.reporter.add_integer_measurement(
+            "total_messages_sent",
+            "totalMessagesSent",
+            "count of messages sent and ack'd by the transport",
+            "message(s)",
+        )
+        self.reporter.add_integer_measurement(
+            "total_messages_acknowledged",
+            "totalMessagesAcknowledged",
+            "count of messages sent to iothub with receipt verified via service sdk",
+            "message(s)",
+        )
+        self.reporter.add_integer_measurement(
+            "message_backlog",
+            "messageBacklog",
+            "count of messages waiting to be sent",
+            "message(s)",
+        )
+        self.reporter.add_integer_measurement(
+            "messages_in_flight",
+            "messagesInFlight",
+            "count of messages sent to iothub but not ack'd by the transport",
+            "message(s)",
+        )
+        self.reporter.add_integer_measurement(
+            "messages_unacknowledged",
+            "messagesUnacknowledged",
+            "count of messages sent to iothub and acked by the transport, but receipt not verified via service sdk",
+            "message(s)",
+        )
 
     def get_longhaul_metrics(self):
         self.metrics.run_time = (
             datetime.datetime.now(datetime.timezone.utc) - self.metrics.run_start_utc
         )
+
+        sent = self.metrics.d2c_sent.get_count()
+        acknowledged = self.metrics.d2c_acknowledged.get_count()
 
         props = {
             "runStartUtc": self.metrics.run_start_utc.isoformat(),
@@ -120,16 +195,11 @@ class DeviceApp(app_base.AppBase):
             "runTime": str(self.metrics.run_time),
             "runState": str(self.metrics.run_state),
             "exitReason": self.metrics.exit_reason,
-            "pingbacks": {
-                "requestsSent": self.metrics.pingback_requests_sent.get_count(),
-                "responsesReceived": self.metrics.pingback_responses_received.get_count(),
-            },
-            "d2c": {
-                "queued": self.telemetry_queue.qsize(),
-                "inFlight": self.metrics.d2c_in_flight.get_count(),
-                "sent": self.metrics.d2c_sent.get_count(),
-                "acknowledged": self.metrics.d2c_acknowledged.get_count(),
-            },
+            "totalMessagesSent": sent,
+            "totalMessagesAcknowledged": acknowledged,
+            "messageBacklog": self.telemetry_queue.qsize(),
+            "messagesInFlight": self.metrics.d2c_in_flight.get_count(),
+            "messagesUnacknowledged": sent - acknowledged,
         }
         return props
 
@@ -137,10 +207,8 @@ class DeviceApp(app_base.AppBase):
         """
         Update reported properties at the start of a run
         """
-        props = {"thief": {"device": self.get_longhaul_metrics()}}
-        props["thief"]["device"].update(
-            self.get_fixed_system_metrics(azure.iot.device.constant.VERSION)
-        )
+        props = {"thief": self.get_longhaul_metrics()}
+        props["thief"].update(self.get_fixed_system_metrics(azure.iot.device.constant.VERSION))
         print("patching {}".format(props))
         self.client.patch_twin_reported_properties(props)
 
@@ -170,10 +238,8 @@ class DeviceApp(app_base.AppBase):
 
         reported_properties = {
             "thief": {
-                "device": {
-                    "serviceAppRunId": None,
-                    "requestedServiceAppRunId": requested_service_app_run_id,
-                }
+                "serviceAppRunId": None,
+                "requestedServiceAppRunId": requested_service_app_run_id,
             }
         }
         logger.debug(
@@ -196,15 +262,15 @@ class DeviceApp(app_base.AppBase):
                 timeout=BOOTSTRAP_SEND_INTERVAL
             )
 
-            if patch and "thief" in patch and "device" in patch["thief"]:
+            if patch and "thief" in patch:
                 logger.debug("Got patch")
-                service_app_run_id = patch["thief"]["device"].get("serviceAppRunId", None)
+                service_app_run_id = patch["thief"].get("serviceAppRunId", None)
                 if service_app_run_id:
                     logger.debug(
                         "Service app {} claimed this device instance".format(service_app_run_id)
                     )
                     self.service_app_run_id = service_app_run_id
-                    reported_properties["thief"]["device"]["serviceAppRunId"] = service_app_run_id
+                    reported_properties["thief"]["serviceAppRunId"] = service_app_run_id
                     self.client.patch_twin_reported_properties(reported_properties)
                     return
                 else:
@@ -259,16 +325,27 @@ class DeviceApp(app_base.AppBase):
 
             pingback_id = str(uuid.uuid4())
 
-            props = {
-                "thief": {
-                    "cmd": "pingback",
-                    "pingbackId": pingback_id,
-                    "device": self.get_longhaul_metrics(),
-                }
-            }
-            props["thief"]["device"].update(self.get_system_health_telemetry())
+            system_health = self.get_system_health_telemetry()
+            longhaul_metrics = self.get_longhaul_metrics()
 
-            # TODO: this is where we push metrics to Azure monitor
+            props = {"thief": {"cmd": "pingback", "pingbackId": pingback_id}}
+            props["thief"].update(longhaul_metrics)
+            props["thief"].update(system_health)
+
+            # push these same metrics to Azure Monitor
+            self.reporter.set_process_cpu_percent(system_health["processCpuPercent"])
+            self.reporter.set_process_working_set(system_health["processWorkingSet"])
+            self.reporter.set_process_bytes_in_all_heaps(system_health["processBytesInAllHeaps"])
+            self.reporter.set_process_private_bytes(system_health["processPrivateBytes"])
+            self.reporter.set_process_working_set_private(system_health["processCpuPercent"])
+            self.reporter.set_total_messages_sent(longhaul_metrics["totalMessagesSent"])
+            self.reporter.set_total_messages_acknowledged(
+                longhaul_metrics["totalMessagesAcknowledged"]
+            )
+            self.reporter.set_message_backlog(longhaul_metrics["messageBacklog"])
+            self.reporter.set_messages_in_flight(longhaul_metrics["messagesInFlight"])
+            self.reporter.set_messages_unacknowledged(longhaul_metrics["messagesUnacknowledged"])
+            self.reporter.record()
 
             msg = Message(json.dumps(props))
             msg.content_type = "application/json"
@@ -305,7 +382,7 @@ class DeviceApp(app_base.AppBase):
             if self.done.isSet():
                 done = True
 
-            props = {"thief": {"device": self.get_longhaul_metrics()}}
+            props = {"thief": self.get_longhaul_metrics()}
 
             logger.info("updating thief props: {}".format(props))
             self.client.patch_twin_reported_properties(props)
@@ -376,12 +453,13 @@ class DeviceApp(app_base.AppBase):
         self.metrics.run_state = app_base.RUNNING
 
         # Create our client and push initial properties
-        self.client = dps.create_device_client_using_dps_group_key(
+        self.client, self.hub, self.device_id = dps.create_device_client_using_dps_group_key(
             provisioning_host=provisioning_host,
             registration_id=registration_id,
             id_scope=id_scope,
             group_symmetric_key=group_symmetric_key,
         )
+        azure_monitor.configure_logging(hub=self.hub, device_id=self.device_id)
         self.update_initial_reported_properties()
 
         # pair with a service app instance

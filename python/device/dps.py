@@ -37,9 +37,10 @@ def create_device_client_using_dps_group_key(
     if registration_result.status != "assigned":
         raise Exception("Invalid rgistration status: {}".result.status)
 
+    hostname = registration_result.registration_state.assigned_hub
+    device_id = registration_result.registration_state.device_id
+
     client = IoTHubDeviceClient.create_from_symmetric_key(
-        symmetric_key=device_key,
-        hostname=registration_result.registration_state.assigned_hub,
-        device_id=registration_result.registration_state.device_id,
+        symmetric_key=device_key, hostname=hostname, device_id=device_id,
     )
-    return client
+    return client, hostname, device_id

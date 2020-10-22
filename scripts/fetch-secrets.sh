@@ -26,8 +26,6 @@ function get-secret {
 # running in the cloud.
 echo "Setting THIEF_DEVICE_ID"
 export THIEF_DEVICE_ID=${USER}_test_device
-echo "Setting THIEF_DEVICE_APP_RUN_ID"
-export THIEF_DEVICE_APP_RUN_ID=${USER}_device_app_run_id
 echo "Setting THIEF_SERVICE_APP_RUN_ID"
 export THIEF_SERVICE_APP_RUN_ID=${USER}_service_app_run_id
 echo "setting THIEF_REQUESTED_SERVICE_APP_RUN_ID"
