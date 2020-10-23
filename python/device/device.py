@@ -18,12 +18,11 @@ from measurement import ThreadSafeCounter
 import azure_monitor
 from azure_monitor_metrics import MetricsReporter
 
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("paho").setLevel(level=logging.DEBUG)
-logging.getLogger("thief").setLevel(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("paho").setLevel(level=logging.INFO)
+logging.getLogger("thief").setLevel(level=logging.INFO)
 
 logger = logging.getLogger("thief.{}".format(__name__))
-
 
 # use os.environ[] for required environment variables
 provisioning_host = os.environ["THIEF_DEVICE_PROVISIONING_HOST"]
@@ -33,16 +32,15 @@ registration_id = os.environ["THIEF_DEVICE_ID"]
 
 # use os.getenv() for optional environment variables
 run_id = os.getenv("THIEF_DEVICE_APP_RUN_ID")
-requested_service_app_run_id = os.getenv("THIEF_REQUESTED_SERVICE_APP_RUN_ID")
+requested_service_pool = os.getenv("THIEF_REQUESTED_SERVICE_POOL")
 
-# Amount of time to wait for a service app to "claim" this device
-BOOTSTRAP_TIMEOUT_INTERVAL = 300
-# Amount of time before resending bootstrap command
-BOOTSTRAP_SEND_INTERVAL = 30
+# Amount of time to wait for a service app to pair with this device
+PAIRING_REQUEST_TIMEOUT_INTERVAL = 300
+# Amount of time before resending pairingRequest command
+PAIR_REQUEST_SENT_INTERVAL = 30
 
 if not run_id:
     run_id = str(uuid.uuid4())
-
 
 # configure our traces and events to go to Azure Monitor
 azure_monitor.configure_logging(
@@ -62,15 +60,15 @@ class DeviceRunMetrics(object):
     def __init__(self):
         self.run_start_utc = None
         self.run_end_utc = None
-        self.run_time = None
+        self.run_time = 0
         self.run_state = app_base.WAITING
         self.exit_reason = None
 
         self.pingback_requests_sent = ThreadSafeCounter()
         self.pingback_responses_received = ThreadSafeCounter()
-        self.d2c_in_flight = ThreadSafeCounter()
+        self.d2c_unacked = ThreadSafeCounter()
         self.d2c_sent = ThreadSafeCounter()
-        self.d2c_acknowledged = ThreadSafeCounter()
+        self.d2c_received_by_service_app = ThreadSafeCounter()
         self.d2c_failed = ThreadSafeCounter()
 
 
@@ -81,7 +79,7 @@ class DeviceRunConfig(object):
     """
 
     def __init__(self):
-        self.max_run_duration = 0
+        self.max_run_duration = 90
 
         self.thief_property_update_interval = 60
         self.watchdog_failure_interval = 300
@@ -118,6 +116,8 @@ class DeviceApp(app_base.AppBase):
         # for metrics
         self.reporter = MetricsReporter()
         self._configure_azure_monitor_metrics()
+        # for pairing
+        self.pair_request_trigger = threading.Event()
 
     def _configure_azure_monitor_metrics(self):
         self.reporter.add_float_measurement(
@@ -153,31 +153,31 @@ class DeviceApp(app_base.AppBase):
         self.reporter.add_integer_measurement(
             "total_messages_sent",
             "totalMessagesSent",
-            "count of messages sent and ack'd by the transport",
+            "Count of messages sent and ack'd by the transport",
             "message(s)",
         )
         self.reporter.add_integer_measurement(
-            "total_messages_acknowledged",
-            "totalMessagesAcknowledged",
-            "count of messages sent to iothub with receipt verified via service sdk",
+            "total_messages_received_by_service",
+            "totalMessagesReceivedByService",
+            "Count of messages sent to iothub with receipt verified via service sdk",
             "message(s)",
         )
         self.reporter.add_integer_measurement(
-            "message_backlog",
-            "messageBacklog",
-            "count of messages waiting to be sent",
+            "messages_in_backlog",
+            "messagesInBacklog",
+            "Count of messages waiting to be sent",
             "message(s)",
         )
         self.reporter.add_integer_measurement(
-            "messages_in_flight",
-            "messagesInFlight",
-            "count of messages sent to iothub but not ack'd by the transport",
+            "messages_unacked",
+            "messagesUnacked",
+            "Count of messages sent to iothub but not ack'd by the transport",
             "message(s)",
         )
         self.reporter.add_integer_measurement(
-            "messages_unacknowledged",
-            "messagesUnacknowledged",
-            "count of messages sent to iothub and acked by the transport, but receipt not verified via service sdk",
+            "messages_not_received_by_service",
+            "messagesNotReceivedByService",
+            "Count of messages sent to iothub and acked by the transport, but receipt not (yet) verified via service sdk",
             "message(s)",
         )
 
@@ -187,7 +187,7 @@ class DeviceApp(app_base.AppBase):
         )
 
         sent = self.metrics.d2c_sent.get_count()
-        acknowledged = self.metrics.d2c_acknowledged.get_count()
+        received_by_service = self.metrics.d2c_received_by_service_app.get_count()
 
         props = {
             "runStartUtc": self.metrics.run_start_utc.isoformat(),
@@ -196,10 +196,10 @@ class DeviceApp(app_base.AppBase):
             "runState": str(self.metrics.run_state),
             "exitReason": self.metrics.exit_reason,
             "totalMessagesSent": sent,
-            "totalMessagesAcknowledged": acknowledged,
-            "messageBacklog": self.telemetry_queue.qsize(),
-            "messagesInFlight": self.metrics.d2c_in_flight.get_count(),
-            "messagesUnacknowledged": sent - acknowledged,
+            "totalMessagesReceivedByService": received_by_service,
+            "messagesInBacklog": self.telemetry_queue.qsize(),
+            "messagesUnacked": self.metrics.d2c_unacked.get_count(),
+            "messagesNotReceivedByService": sent - received_by_service,
         }
         return props
 
@@ -217,12 +217,11 @@ class DeviceApp(app_base.AppBase):
         "pair" with a service app. This is necessary because we can have a single
         service app responsible for multiple device apps.  The pairing process works
         like this:
-        1. The device sets reported properties saying it doesn't have a service app
-            and any preferernces it has about what service app resopnds.  (currently, it
-            can specify the exact service app using the service app's run ID, but we may add
-            more preferences later.)
-        2. The device app sends a "bootstrap" d2c message.
-        3. All service apps watch for all "bootstrap" messages.  If some service app instance
+
+        1. The device sets reported properties saying that it isn't paired and also any
+            perferences it has about it's prospective partner.
+        2. The device app sends a "pairingRequest" d2c message.
+        3. All service apps watch for all pairingRequest messages.  If some service app instance
             wants to get paired with a device, it sets a desired property to indicate that it's
             available.  If multiple service apps set the property, the winner is chosen by the
             device app, probably based on whatever value happens to be in the desired property
@@ -232,41 +231,47 @@ class DeviceApp(app_base.AppBase):
             sends.
 
         Right now, there is no provision for a failing service app.  In the future, the device
-        code _could_ see that the service app isn't responding and start the bootstrap process
+        code _could_ see that the service app isn't responding and start the pairing process
         over again.
         """
+
+        # pairing ID is used to distinguish this pairingRequest from any previous pairingRequests
+        # which may have been handled in the past.
+        pairing_id = str(uuid.uuid4())
 
         reported_properties = {
             "thief": {
                 "serviceAppRunId": None,
-                "requestedServiceAppRunId": requested_service_app_run_id,
+                "requestedServicePool": requested_service_pool,
+                "pairingId": pairing_id,
             }
         }
-        logger.debug(
+        logger.info(
             "Attempting to pair with service instance.  Setting reported properties: {}".format(
                 reported_properties
             )
         )
         self.client.patch_twin_reported_properties(reported_properties)
 
-        logger.debug("sending bootstrap message")
-        bootstrap_message = Message(json.dumps({"thief": {"cmd": "bootstrap"}}))
-        bootstrap_message.content_type = "application/json"
-        bootstrap_message.content_encoding = "utf-8"
-        self.client.send_message(bootstrap_message)
+        logger.info("sending pairingRequest message")
+        pairing_request_message = Message(json.dumps({"thief": {"cmd": "pairingRequest"}}))
+        pairing_request_message.content_type = "application/json"
+        pairing_request_message.content_encoding = "utf-8"
+        self.client.send_message(pairing_request_message)
 
         start_time = time.time()
-        while time.time() - start_time < BOOTSTRAP_TIMEOUT_INTERVAL:
-            logger.debug("Waiting for service app to claim this device")
+        while time.time() - start_time < PAIRING_REQUEST_TIMEOUT_INTERVAL:
+            logger.info("Waiting for service app to claim this device")
             patch = self.client.receive_twin_desired_properties_patch(
-                timeout=BOOTSTRAP_SEND_INTERVAL
+                timeout=PAIR_REQUEST_SENT_INTERVAL
             )
 
             if patch and "thief" in patch:
-                logger.debug("Got patch")
-                service_app_run_id = patch["thief"].get("serviceAppRunId", None)
-                if service_app_run_id:
-                    logger.debug(
+                logger.info("Got patch")
+                thief = patch["thief"]
+                service_app_run_id = thief.get("serviceAppRunId", None)
+                if (thief.get("pairingId", None) == pairing_id) and service_app_run_id:
+                    logger.info(
                         "Service app {} claimed this device instance".format(service_app_run_id)
                     )
                     self.service_app_run_id = service_app_run_id
@@ -274,12 +279,26 @@ class DeviceApp(app_base.AppBase):
                     self.client.patch_twin_reported_properties(reported_properties)
                     return
                 else:
-                    logger.debug("patch received, but serviceAppRunId not set: {}".format(patch))
+                    logger.info("patch received, but serviceAppRunId not set")
 
-            logger.debug("Still no assigned service instance. Sending new bootstrap message")
-            self.client.send_message(bootstrap_message)
+            logger.info("Still no assigned service instance. Sending new pairingRequest message")
+            self.client.send_message(pairing_request_message)
 
         raise Exception("timeout waitig for service to set serviceAppRunId")
+
+    def pairing_thread(self, worker_thread_info):
+
+        while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
+
+            self.pair_request_trigger.wait(timeout=10)
+
+            if self.pair_request_trigger.isSet():
+                logger.info(
+                    "pairing_thread: pair_request_trigger is set.  Starting pairing process"
+                )
+                self.pair_with_service_instance()
+                self.pair_request_trigger.clear()
 
     def send_telemetry_thread(self, worker_thread_info):
         """
@@ -298,7 +317,7 @@ class DeviceApp(app_base.AppBase):
                 msg = None
             if msg:
                 try:
-                    self.metrics.d2c_in_flight.increment()
+                    self.metrics.d2c_unacked.increment()
                     self.client.send_message(msg)
                 except Exception as e:
                     # TODO: check failure count
@@ -310,7 +329,7 @@ class DeviceApp(app_base.AppBase):
                     self.metrics.pingback_requests_sent.increment()
                     self.metrics.d2c_sent.increment()
                 finally:
-                    self.metrics.d2c_in_flight.decrement()
+                    self.metrics.d2c_unacked.decrement()
 
     def test_d2c_thread(self, worker_thread_info):
         """
@@ -328,7 +347,7 @@ class DeviceApp(app_base.AppBase):
             system_health = self.get_system_health_telemetry()
             longhaul_metrics = self.get_longhaul_metrics()
 
-            props = {"thief": {"cmd": "pingback", "pingbackId": pingback_id}}
+            props = {"thief": {"cmd": "pingbackRequest", "pingbackId": pingback_id}}
             props["thief"].update(longhaul_metrics)
             props["thief"].update(system_health)
 
@@ -339,12 +358,14 @@ class DeviceApp(app_base.AppBase):
             self.reporter.set_process_private_bytes(system_health["processPrivateBytes"])
             self.reporter.set_process_working_set_private(system_health["processCpuPercent"])
             self.reporter.set_total_messages_sent(longhaul_metrics["totalMessagesSent"])
-            self.reporter.set_total_messages_acknowledged(
-                longhaul_metrics["totalMessagesAcknowledged"]
+            self.reporter.set_total_messages_received_by_service(
+                longhaul_metrics["totalMessagesReceivedByService"]
             )
-            self.reporter.set_message_backlog(longhaul_metrics["messageBacklog"])
-            self.reporter.set_messages_in_flight(longhaul_metrics["messagesInFlight"])
-            self.reporter.set_messages_unacknowledged(longhaul_metrics["messagesUnacknowledged"])
+            self.reporter.set_messages_in_backlog(longhaul_metrics["messagesInBacklog"])
+            self.reporter.set_messages_unacked(longhaul_metrics["messagesUnacked"])
+            self.reporter.set_messages_not_received_by_service(
+                longhaul_metrics["messagesNotReceivedByService"]
+            )
             self.reporter.record()
 
             msg = Message(json.dumps(props))
@@ -356,7 +377,7 @@ class DeviceApp(app_base.AppBase):
             msg.custom_properties["serviceAppRunId"] = self.service_app_run_id
 
             def on_pingback_received(pingback_id):
-                self.metrics.d2c_acknowledged.increment()
+                self.metrics.d2c_received_by_service_app.increment()
 
             with self.pingback_list_lock:
                 self.pingback_wait_list[pingback_id] = (on_pingback_received, (pingback_id,))
@@ -406,11 +427,11 @@ class DeviceApp(app_base.AppBase):
                 cmd = thief.get("cmd") if thief else None
                 if cmd == "pingbackResponse":
                     self.metrics.pingback_responses_received.increment()
-                    list = thief.get("pingbackIds")
+                    list = thief.get("pingbacks")
                     if list:
                         with self.pingback_list_lock:
-                            for pingback_id in list:
-                                self.received_pingback_list.append(pingback_id)
+                            for pingback in list:
+                                self.received_pingback_list.append(pingback)
                         self.new_pingback_event.set()
                 else:
                     logger.warning("Unknown command received: {}".format(obj))
@@ -430,7 +451,8 @@ class DeviceApp(app_base.AppBase):
 
             with self.pingback_list_lock:
                 new_list = []
-                for pingback_id in self.received_pingback_list:
+                for pingback in self.received_pingback_list:
+                    pingback_id = pingback["pingbackId"]
                     if pingback_id in self.pingback_wait_list:
                         # we've received a pingback.  Don't call back here because we're holding
                         # pingback_lock_list.  Instead, add to a list and call back when we're
@@ -439,7 +461,7 @@ class DeviceApp(app_base.AppBase):
                         del self.pingback_wait_list[pingback_id]
                     else:
                         # Not waiting for this pingback (yet?).  Keep it in our list.
-                        new_list.append(pingback_id)
+                        new_list.append(pingback)
                 self.received_pingback_list = new_list
 
             for (function, args) in callbacks:
