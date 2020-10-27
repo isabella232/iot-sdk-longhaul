@@ -8,6 +8,7 @@ import uuid
 import json
 import datetime
 import threading
+import collections
 from concurrent.futures import ThreadPoolExecutor
 import dps
 import queue
@@ -18,7 +19,7 @@ from measurement import ThreadSafeCounter
 import azure_monitor
 from azure_monitor_metrics import MetricsReporter
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logging.getLogger("paho").setLevel(level=logging.INFO)
 logging.getLogger("thief").setLevel(level=logging.INFO)
 
@@ -34,11 +35,6 @@ registration_id = os.environ["THIEF_DEVICE_ID"]
 run_id = os.getenv("THIEF_DEVICE_APP_RUN_ID")
 requested_service_pool = os.getenv("THIEF_REQUESTED_SERVICE_POOL")
 
-# Amount of time to wait for a service app to pair with this device
-PAIRING_REQUEST_TIMEOUT_INTERVAL = 300
-# Amount of time before resending pairingRequest command
-PAIR_REQUEST_SENT_INTERVAL = 30
-
 if not run_id:
     run_id = str(uuid.uuid4())
 
@@ -50,6 +46,10 @@ event_logger = azure_monitor.get_event_logger()
 azure_monitor.log_to_azure_monitor("thief")
 azure_monitor.log_to_azure_monitor("azure")
 azure_monitor.log_to_azure_monitor("paho")
+
+MessageWaitingToArrive = collections.namedtuple(
+    "MessageWaitingToArrive", "callback pingback_id message send_time"
+)
 
 
 class DeviceRunMetrics(object):
@@ -78,16 +78,49 @@ class DeviceRunConfig(object):
     Currently hardcoded. Later, this will come from desired properties.
     """
 
+    # All durations are in seconds
     def __init__(self):
-        self.max_run_duration = 90
+        # how long should the test run before finishing.  0 = forever
+        self.max_run_duration = 0
 
+        # How often do we update reported properties
         self.thief_property_update_interval = 60
+
+        # How long can a thread go without updating its watchdog before failing.
         self.watchdog_failure_interval = 300
 
-        self.d2c_operations_per_second = 5
-        self.d2c_slowness_threshold = 60
-        self.d2c_failures_allowed = 10
-        self.d2c_slow_operations_allowed = 100
+        # How long to keep trying to pair with a service instance before giving up.
+        self.pairing_request_timeout_interval = 900
+
+        # How many seconds to wait before sending a new pairingRequest message
+        self.pairing_request_send_interval = 30
+
+        # How many times to call send_message per second
+        self.send_message_operations_per_second = 1
+
+        # How many threads do we spin up for overlapped send_message calls.  These threads
+        # pull messages off of a single outgoing queue.  If all of the send_message threads
+        # are busy, outgoing messages will just pile up in the queue.
+        self.send_message_thread_count = 10
+
+        # How long do we wait for notification that the service app received a
+        # message before we consider it a failure?
+        self.send_message_arrival_failure_interval = 3600
+
+        # How many messages fail to arrive at the service before we fail the test
+        # This counts messages that have been sent and acked, but the service app hasn't reported receipt.
+        self.send_message_arrival_failure_count = 10
+
+        # How many messages to we allow in the send_message backlog before we fail the test.
+        # This counts messages that gets backed up because send_message hasn't even been called yet.
+        self.send_message_backlog_failure_count = 200
+
+        # How many unack'ed messages do we allow before we fail the test?
+        # This counts messages that either haven't been sent, or they've been sent but not ack'ed by the receiver
+        self.send_message_unacked_failure_count = 200
+
+        # How many send_message exceptions do we allow before we fail the test?
+        self.send_message_exception_failure_count = 5
 
 
 class DeviceApp(app_base.AppBase):
@@ -197,11 +230,31 @@ class DeviceApp(app_base.AppBase):
             "exitReason": self.metrics.exit_reason,
             "totalMessagesSent": sent,
             "totalMessagesReceivedByService": received_by_service,
+            "totalMessagesFailed": self.metrics.d2c_failed.get_count(),
             "messagesInBacklog": self.telemetry_queue.qsize(),
             "messagesUnacked": self.metrics.d2c_unacked.get_count(),
             "messagesNotReceivedByService": sent - received_by_service,
         }
         return props
+
+    def get_longhaul_config_properties(self):
+        """
+        return test configuration values as dictionary entries that can be put into reported
+        properties
+        """
+        return {
+            "configPropertyUpdateInterval": self.config.thief_property_update_interval,
+            "configWatchdogFailureInterval": self.config.watchdog_failure_interval,
+            "configPairingRequestTimeoutInterval": self.config.pairing_request_timeout_interval,
+            "configPairingRequestSendInterval": self.config.pairing_request_send_interval,
+            "configSendMessageOperationsPerSecond": self.config.send_message_operations_per_second,
+            "configSendMessageThreadCount": self.config.send_message_thread_count,
+            "configSendMessageArrivalFailureInterval": self.config.send_message_arrival_failure_interval,
+            "configSendMessageArrivalFailureCount": self.config.send_message_arrival_failure_count,
+            "configSendMessageBacklogFailureCount": self.config.send_message_backlog_failure_count,
+            "configSendMessageUnackedFailureCount": self.config.send_message_unacked_failure_count,
+            "configSendMessageExceptionFailureCount": self.config.send_message_exception_failure_count,
+        }
 
     def update_initial_reported_properties(self):
         """
@@ -209,6 +262,7 @@ class DeviceApp(app_base.AppBase):
         """
         props = {"thief": self.get_longhaul_metrics()}
         props["thief"].update(self.get_fixed_system_metrics(azure.iot.device.constant.VERSION))
+        props["thief"].update(self.get_longhaul_config_properties())
         print("patching {}".format(props))
         self.client.patch_twin_reported_properties(props)
 
@@ -260,10 +314,10 @@ class DeviceApp(app_base.AppBase):
         self.client.send_message(pairing_request_message)
 
         start_time = time.time()
-        while time.time() - start_time < PAIRING_REQUEST_TIMEOUT_INTERVAL:
+        while time.time() - start_time < self.config.pairing_request_timeout_interval:
             logger.info("Waiting for service app to claim this device")
             patch = self.client.receive_twin_desired_properties_patch(
-                timeout=PAIR_REQUEST_SENT_INTERVAL
+                timeout=self.config.pairing_request_send_interval
             )
 
             if patch and "thief" in patch:
@@ -320,9 +374,6 @@ class DeviceApp(app_base.AppBase):
                     self.metrics.d2c_unacked.increment()
                     self.client.send_message(msg)
                 except Exception as e:
-                    # TODO: check failure count
-                    # TODO: look at duration and flag
-                    # TODO: add enqueued time somewhere
                     self.metrics.d2c_failed.increment()
                     logger.error("send_message raised {}".format(e), exc_info=True)
                 else:
@@ -380,14 +431,19 @@ class DeviceApp(app_base.AppBase):
                 self.metrics.d2c_received_by_service_app.increment()
 
             with self.pingback_list_lock:
-                self.pingback_wait_list[pingback_id] = (on_pingback_received, (pingback_id,))
+                self.pingback_wait_list[pingback_id] = MessageWaitingToArrive(
+                    callback=on_pingback_received,
+                    pingback_id=pingback_id,
+                    message=msg,
+                    send_time=time.time(),
+                )
 
             # This function only queues the message.  A send_telemetry_thread instance will pick
             # it up and send it.
             self.telemetry_queue.put(msg)
 
             # sleep until we need to send again
-            self.done.wait(1 / self.config.d2c_operations_per_second)
+            self.done.wait(1 / self.config.send_message_operations_per_second)
 
     def update_thief_properties_thread(self, worker_thread_info):
         """
@@ -447,7 +503,7 @@ class DeviceApp(app_base.AppBase):
         while not self.done.isSet():
             worker_thread_info.watchdog_time = time.time()
             self.new_pingback_event.clear()
-            callbacks = []
+            arrivals = []
 
             with self.pingback_list_lock:
                 new_list = []
@@ -457,17 +513,89 @@ class DeviceApp(app_base.AppBase):
                         # we've received a pingback.  Don't call back here because we're holding
                         # pingback_lock_list.  Instead, add to a list and call back when we're
                         # not holding the lock.
-                        callbacks.append(self.pingback_wait_list[pingback_id])
+                        arrivals.append(self.pingback_wait_list[pingback_id])
                         del self.pingback_wait_list[pingback_id]
                     else:
                         # Not waiting for this pingback (yet?).  Keep it in our list.
                         new_list.append(pingback)
                 self.received_pingback_list = new_list
 
-            for (function, args) in callbacks:
-                function(*args)
+            for arrival in arrivals:
+                arrival.callback(arrival.pingback_id)
 
             self.new_pingback_event.wait(timeout=1)
+
+    def failure_metric_watcher_thread(self, worker_thread_info):
+        """
+        Thread which is responsible for watching for test failures based on limits that are
+        exceeded.
+
+        These checks were put into their own thread for 2 reasons:
+
+        1. to centralize this code.
+
+        2. because we have multiple threads doing things like calling send_message.  If we check
+           these limits inside those threads, we have the chance for multiple overlapping checks.
+           This isn't necessarily destructive, but it could be confusing when analyzing logs.
+
+       """
+
+        while not self.done.isSet():
+            worker_thread_info.watchdog_time = time.time()
+
+            arrival_failure_count = 0
+            now = time.time()
+            with self.pingback_list_lock:
+                for message_waiting in self.pingback_wait_list.values():
+                    if (
+                        now - message_waiting.send_time
+                    ) > self.config.send_message_arrival_failure_interval:
+                        logger.warning(
+                            "arrival time for {} of {} seconds is longer than failure interval of {}".format(
+                                message_waiting.pingback_id,
+                                (now - message_waiting.send_time),
+                                self.config.send_message_arrival_failure_interval,
+                            )
+                        )
+                        arrival_failure_count += 1
+
+            if arrival_failure_count > self.config.send_message_arrival_failure_count:
+                raise Exception(
+                    "count of failed arrivals of {} is greater than maximum count of {}".format(
+                        arrival_failure_count, self.config.send_message_arrival_failure_count
+                    )
+                )
+
+            if self.telemetry_queue.qsize() > self.config.send_message_backlog_failure_count:
+                raise Exception(
+                    "send_message backlog with {} items exceeded maxiumum count of {} items".format(
+                        self.telemetry_queue.qsize(), self.config.send_message_backlog_failure_count
+                    )
+                )
+
+            if (
+                self.metrics.d2c_unacked.get_count()
+                > self.config.send_message_unacked_failure_count
+            ):
+                raise Exception(
+                    "unacked message count  of with {} items exceeded maxiumum count of {} items".format(
+                        self.metrics.d2c_unacked.get_count,
+                        self.config.send_message_unacked_failure_count,
+                    )
+                )
+
+            if (
+                self.metrics.d2c_failed.get_count()
+                > self.config.send_message_exception_failure_count
+            ):
+                raise Exception(
+                    "send_message failure count of {} exceeds maximum count of {} failures".format(
+                        self.metrics.d2c_failed.get_count(),
+                        self.config.send_message_exception_failure_count,
+                    )
+                )
+
+            time.sleep(10)
 
     def main(self):
 
@@ -495,13 +623,18 @@ class DeviceApp(app_base.AppBase):
             ),
             app_base.WorkerThreadInfo(self.handle_pingback_thread, "handle_pingback_thread"),
             app_base.WorkerThreadInfo(self.test_d2c_thread, "test_d2c_thead"),
+            app_base.WorkerThreadInfo(
+                self.failure_metric_watcher_thread, "failure_metric_watcher_thread"
+            ),
         ]
-        for i in range(0, self.config.d2c_operations_per_second * 2):
+        for i in range(0, self.config.send_message_thread_count):
             worker_thread_infos.append(
                 app_base.WorkerThreadInfo(
                     self.send_telemetry_thread, "send_telemetry_thread #{}".format(i)
                 )
             )
+
+        # TODO: add virtual function that can be used to wait for all messages to arrive after test is done
 
         self.run_threads(worker_thread_infos)
 

@@ -126,6 +126,9 @@ class AppBase(object):
                     time.sleep(1)
 
         logger.info("Run is complete.  Cleaning up.")
+        logger.info(
+            "state = {}, exit reason = {}".format(self.metrics.run_state, self.metrics.exit_reason)
+        )
         self.metrics.run_end_utc = datetime.datetime.now(datetime.timezone.utc)
         self.done.set()
         self.pre_shutdown()
