@@ -100,7 +100,7 @@ class DeviceRunConfig(object):
         # How many threads do we spin up for overlapped send_message calls.  These threads
         # pull messages off of a single outgoing queue.  If all of the send_message threads
         # are busy, outgoing messages will just pile up in the queue.
-        self.send_outgoing_messages_thread_count = 10
+        self.send_message_thread_count = 10
 
         # How long do we wait for notification that the service app received a
         # message before we consider it a failure?
@@ -141,8 +141,7 @@ class DeviceApp(app_base.AppBase):
         # for pingbacks
         self.pingback_list_lock = threading.Lock()
         self.pingback_wait_list = {}
-        self.received_pingback_list = []
-        self.new_pingback_event = threading.Event()
+        self.incoming_pingback_response_queue = queue.Queue()
         # for telemetry
         self.outgoing_send_message_queue = queue.Queue()
         # for metrics
@@ -247,7 +246,7 @@ class DeviceApp(app_base.AppBase):
             "configPairingRequestTimeoutInterval": self.config.pairing_request_timeout_interval,
             "configPairingRequestSendInterval": self.config.pairing_request_send_interval,
             "configSendMessageOperationsPerSecond": self.config.send_message_operations_per_second,
-            "configSendOutgoingMessagesThreadCount": self.config.send_outgoing_messages_thread_count,
+            "configSendMessageThreadCount": self.config.send_message_thread_count,
             "configSendMessageArrivalFailureInterval": self.config.send_message_arrival_failure_interval,
             "configSendMessageArrivalFailureCount": self.config.send_message_arrival_failure_count,
             "configSendMessageBacklogFailureCount": self.config.send_message_backlog_failure_count,
@@ -352,16 +351,24 @@ class DeviceApp(app_base.AppBase):
                 self.pair_with_service_instance()
                 self.pair_request_trigger.clear()
 
-    def send_outgoing_messages_thread(self, worker_thread_info):
+    def is_pairing_complete(self):
+        """
+        return True if the pairing process is complete
+        """
+        return True if self.service_app_run_id else False
+
+    def send_message_thread(self, worker_thread_info):
         """
         Thread which reads the telemetry queue and sends the telemetry.  Since send_message is
         blocking, and we want to overlap send_messsage calls, we create multiple
-        send_outgoing_messages_thread instances so we can send multiple messages at the same time.
+        send_message_thread instances so we can send multiple messages at the same time.
 
-        The number of send_outgoing_messages_thread instances is the number of overlapped sent operations
+        The number of send_message_thread instances is the number of overlapped sent operations
         we can have
         """
         while not self.done.isSet():
+            # We do not check is_pairing_complete here because we use this thread to
+            # send pairing requests.
             worker_thread_info.watchdog_time = time.time()
             try:
                 msg = self.outgoing_send_message_queue.get(timeout=1)
@@ -402,49 +409,60 @@ class DeviceApp(app_base.AppBase):
         Thread to continuously send d2c messages throughout the longhaul run.  This thread doesn't
         actually send messages becauase send_message is blocking and we want to overlap our send
         operations.  Instead, this thread adds the messsage to a queue, and relies on a
-        send_outgoing_messages_thread instance to actually send the message.
+        send_message_thread instance to actually send the message.
         """
 
         while not self.done.isSet():
             worker_thread_info.watchdog_time = time.time()
 
-            pingback_id = str(uuid.uuid4())
+            if self.is_pairing_complete():
+                pingback_id = str(uuid.uuid4())
 
-            system_health = self.get_system_health_telemetry()
-            longhaul_metrics = self.get_longhaul_metrics()
+                system_health = self.get_system_health_telemetry()
+                longhaul_metrics = self.get_longhaul_metrics()
 
-            props = {"thief": {"cmd": "pingbackRequest", "pingbackId": pingback_id}}
-            props["thief"].update(longhaul_metrics)
-            props["thief"].update(system_health)
+                props = {
+                    "thief": {
+                        "cmd": "pingbackRequest",
+                        "pingbackId": pingback_id,
+                        "serviceAppRunId": self.service_app_run_id,
+                    }
+                }
+                props["thief"].update(longhaul_metrics)
+                props["thief"].update(system_health)
 
-            # push these same metrics to Azure Monitor
-            self.send_metrics_to_azure_monitor(props["thief"])
+                # push these same metrics to Azure Monitor
+                self.send_metrics_to_azure_monitor(props["thief"])
 
-            msg = Message(json.dumps(props))
-            msg.content_type = "application/json"
-            msg.content_encoding = "utf-8"
-            msg.custom_properties["eventDateTimeUtc"] = datetime.datetime.now(
-                datetime.timezone.utc
-            ).isoformat()
-            msg.custom_properties["serviceAppRunId"] = self.service_app_run_id
+                msg = Message(json.dumps(props))
+                msg.content_type = "application/json"
+                msg.content_encoding = "utf-8"
+                msg.custom_properties["eventDateTimeUtc"] = datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat()
+                msg.custom_properties["serviceAppRunId"] = self.service_app_run_id
 
-            def on_pingback_received(pingback_id):
-                self.metrics.send_message_count_received_by_service_app.increment()
+                def on_pingback_received(pingback_id):
+                    self.metrics.send_message_count_received_by_service_app.increment()
 
-            with self.pingback_list_lock:
-                self.pingback_wait_list[pingback_id] = MessageWaitingToArrive(
-                    callback=on_pingback_received,
-                    pingback_id=pingback_id,
-                    message=msg,
-                    send_time=time.time(),
-                )
+                with self.pingback_list_lock:
+                    self.pingback_wait_list[pingback_id] = MessageWaitingToArrive(
+                        callback=on_pingback_received,
+                        pingback_id=pingback_id,
+                        message=msg,
+                        send_time=time.time(),
+                    )
 
-            # This function only queues the message.  A send_telemetry_thread instance will pick
-            # it up and send it.
-            self.outgoing_send_message_queue.put(msg)
+                # This function only queues the message.  A send_message_thread instance will pick
+                # it up and send it.
+                self.outgoing_send_message_queue.put(msg)
 
-            # sleep until we need to send again
-            self.done.wait(1 / self.config.send_message_operations_per_second)
+                # sleep until we need to send again
+                self.done.wait(1 / self.config.send_message_operations_per_second)
+
+            else:
+                # pairing is not complete
+                time.sleep(1)
 
     def update_thief_properties_thread(self, worker_thread_info):
         """
@@ -481,16 +499,16 @@ class DeviceApp(app_base.AppBase):
             if msg:
                 obj = json.loads(msg.data.decode())
                 thief = obj.get("thief")
-                cmd = thief.get("cmd") if thief else None
-                if cmd == "pingbackResponse":
-                    list = thief.get("pingbacks")
-                    if list:
-                        with self.pingback_list_lock:
-                            for pingback in list:
-                                self.received_pingback_list.append(pingback)
-                        self.new_pingback_event.set()
+
+                if thief:
+                    cmd = thief["cmd"]
+                    if cmd == "pingbackResponse":
+                        self.incoming_pingback_response_queue.put(msg)
+                    else:
+                        logger.warning("Unknown command received: {}".format(obj))
+
                 else:
-                    logger.warning("Unknown command received: {}".format(obj))
+                    logger.warning("C2d received, but it's not for us: {}".format(obj))
 
     def handle_pingback_response_thread(self, worker_thread_info):
         """
@@ -499,28 +517,31 @@ class DeviceApp(app_base.AppBase):
 
         while not self.done.isSet():
             worker_thread_info.watchdog_time = time.time()
-            self.new_pingback_event.clear()
-            arrivals = []
 
-            with self.pingback_list_lock:
-                new_list = []
-                for pingback in self.received_pingback_list:
-                    pingback_id = pingback["pingbackId"]
-                    if pingback_id in self.pingback_wait_list:
-                        # we've received a pingback.  Don't call back here because we're holding
-                        # pingback_lock_list.  Instead, add to a list and call back when we're
-                        # not holding the lock.
-                        arrivals.append(self.pingback_wait_list[pingback_id])
-                        del self.pingback_wait_list[pingback_id]
-                    else:
-                        # Not waiting for this pingback (yet?).  Keep it in our list.
-                        new_list.append(pingback)
-                self.received_pingback_list = new_list
+            try:
+                msg = self.incoming_pingback_response_queue.get(timeout=1)
+            except queue.Empty:
+                msg = None
 
-            for arrival in arrivals:
-                arrival.callback(arrival.pingback_id)
+            if msg:
+                arrivals = []
+                thief = json.loads(msg.data.decode())["thief"]
 
-            self.new_pingback_event.wait(timeout=1)
+                with self.pingback_list_lock:
+                    for pingback in thief["pingbacks"]:
+                        pingback_id = pingback["pingbackId"]
+
+                        if pingback_id in self.pingback_wait_list:
+                            # we've received a pingback.  Don't call back here because we're holding
+                            # pingback_lock_list.  Instead, add to a list and call back when we're
+                            # not holding the lock.
+                            arrivals.append(self.pingback_wait_list[pingback_id])
+                            del self.pingback_wait_list[pingback_id]
+                        else:
+                            logger.warning("Received unkonwn pingbackId: {}:".format(pingback_id))
+
+                for arrival in arrivals:
+                    arrival.callback(arrival.pingback_id)
 
     def check_for_failure_thread(self, worker_thread_info):
         """
@@ -630,11 +651,10 @@ class DeviceApp(app_base.AppBase):
             app_base.WorkerThreadInfo(self.test_send_message_thread, "test_send_message_thread"),
             app_base.WorkerThreadInfo(self.check_for_failure_thread, "check_for_failure_thread"),
         ]
-        for i in range(0, self.config.send_outgoing_messages_thread_count):
+        for i in range(0, self.config.send_message_thread_count):
             worker_thread_infos.append(
                 app_base.WorkerThreadInfo(
-                    self.send_outgoing_messages_thread,
-                    "send_outgoing_messages_thread #{}".format(i),
+                    self.send_message_thread, "send_message_thread #{}".format(i),
                 )
             )
 
