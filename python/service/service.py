@@ -16,7 +16,6 @@ from azure.iot.hub.models import Twin, TwinProperties
 import azure.iot.hub.constant
 from azure.eventhub import EventHubConsumerClient
 import azure_monitor
-from measurement import ThreadSafeCounter
 
 
 logging.basicConfig(level=logging.WARNING)
@@ -63,9 +62,6 @@ class ServiceRunMetrics(object):
         self.run_state = app_base.WAITING
         self.exit_reason = None
 
-        self.pingback_requests_received = ThreadSafeCounter()
-        self.pingback_responses_sent = ThreadSafeCounter()
-
 
 class ServiceRunConfig(object):
     """
@@ -96,28 +92,26 @@ class ServiceApp(app_base.AppBase):
         self.registry_manager_lock = threading.Lock()
         self.registry_manager = None
         self.eventhub_consumer_client = None
-        self.shutdown_event = threading.Event()
         self.metrics = ServiceRunMetrics()
         self.config = ServiceRunConfig()
 
         # for any kind of c2d
-        self.c2d_send_queue = queue.Queue()
+        self.outgoing_c2d_queue = queue.Queue()
 
         # for pingbacks
-        self.pingback_request_events = queue.Queue()
-        self.pingback_request_events_lock = threading.Lock()
+        self.incoming_pingback_request_queue = queue.Queue()
 
         # for pairing
-        self.pairing_queue = queue.Queue()
+        self.incoming_pairing_request_queue = queue.Queue()
         self.pairing_list_lock = threading.Lock()
         self.paired_devices = []
 
     def add_device_to_pairing_list(self, event):
         device_id = get_device_id_from_event(event)
         logger.info("pairing request received for device {}. Queueing.".format(device_id))
-        self.pairing_queue.put(event)
+        self.incoming_pairing_request_queue.put(event)
 
-    def pairing_thread(self, worker_thread_info):
+    def handle_pairing_request_thread(self, worker_thread_info):
         """
         Thread responsible for responding to pairing requests from devices.
         The pairing handshake is documented in device.py inside the
@@ -135,7 +129,7 @@ class ServiceApp(app_base.AppBase):
 
             # Step #1: see if we have any pairingRequest waiting in the queue
             try:
-                event = self.pairing_queue.get_nowait()
+                event = self.incoming_pairing_request_queue.get_nowait()
             except queue.Empty:
                 event = None
 
@@ -261,10 +255,10 @@ class ServiceApp(app_base.AppBase):
                 # TODO: remove items from list of no traffic for X minutes
 
             # Step 4: sleep a while (but only if there's nothing in the queue)
-            if self.pairing_queue.empty():
+            if self.incoming_pairing_request_queue.empty():
                 time.sleep(10)
 
-    def eventhub_dispatcher_thread(self, worker_thread_info):
+    def dispatch_incoming_messages_thread(self, worker_thread_info):
         """
         Thread to listen on eventhub for events that we can handle.  Right now, we service
         events on all partitions, but we could restrict this and have one (or more) service app(s)
@@ -284,26 +278,28 @@ class ServiceApp(app_base.AppBase):
             # TODO: find a better place to update the watchdog.  This will cause the service
             # app to fail if no messages are received for a long time.
             worker_thread_info.watchdog_time = time.time()
+
             body = event.body_as_json()
             thief = body.get("thief")
             cmd = thief.get("cmd") if thief else None
 
             device_id = get_device_id_from_event(event)
-            event_service_run_app_id = event.properties.get(b"serviceAppRunId", b"").decode("utf-8")
+            service_app_run_id = event.properties.get(b"serviceAppRunId", b"").decode("utf-8")
 
             if cmd == "pairingRequest":
                 logger.debug("Got pairingRequest command for device {}".format(device_id))
                 self.add_device_to_pairing_list(event)
 
-            elif event_service_run_app_id == run_id:
+            elif service_app_run_id == run_id:
                 if cmd == "pingbackRequest":
                     logger.debug(
                         "received pingback request from {} with pingbackId {}".format(
                             device_id, event.body_as_json()["thief"]["pingbackId"]
                         )
                     )
-                    with self.pingback_request_events_lock:
-                        self.pingback_request_events.put((event, partition_context.partition_id))
+                    self.incoming_pingback_request_queue.put(
+                        (event, partition_context.partition_id)
+                    )
                 else:
                     logger.info("Unknown command received from {}: {}".format(device_id, body))
 
@@ -316,11 +312,11 @@ class ServiceApp(app_base.AppBase):
                 on_partition_close=on_partition_close,
             )
 
-    def c2d_sender_thread(self, worker_thread_info):
-        while not (self.done.isSet() and self.c2d_send_queue.empty()):
+    def send_outgoing_c2d_messages_thread(self, worker_thread_info):
+        while not (self.done.isSet() and self.outgoing_c2d_queue.empty()):
             worker_thread_info.watchdog_time = time.time()
             try:
-                (device_id, message, props) = self.c2d_send_queue.get(timeout=1)
+                (device_id, message, props) = self.outgoing_c2d_queue.get(timeout=1)
             except queue.Empty:
                 pass
             else:
@@ -353,7 +349,7 @@ class ServiceApp(app_base.AppBase):
                             )
                             raise
 
-    def pingback_thread(self, worker_thread_info):
+    def handle_pingback_request_thread(self, worker_thread_info):
         """
         Thread which is responsible for returning pingback response message to the
         device client on the other side of the wall.
@@ -364,7 +360,7 @@ class ServiceApp(app_base.AppBase):
             pingbacks = {}
             while True:
                 try:
-                    (event, partition_id) = self.pingback_request_events.get_nowait()
+                    (event, partition_id) = self.incoming_pingback_request_queue.get_nowait()
                 except queue.Empty:
                     break
                 device_id = get_device_id_from_event(event)
@@ -375,7 +371,6 @@ class ServiceApp(app_base.AppBase):
                 pingbacks[device_id].append(
                     {"pingbackId": pingback_id, "partitionId": partition_id, "offset": event.offset}
                 )
-                self.metrics.pingback_requests_received.increment()
 
             if len(pingbacks):
                 for device_id in pingbacks:
@@ -389,15 +384,13 @@ class ServiceApp(app_base.AppBase):
                         {"thief": {"cmd": "pingbackResponse", "pingbacks": pingbacks[device_id]}}
                     )
 
-                    self.c2d_send_queue.put(
+                    self.outgoing_c2d_queue.put(
                         (
                             device_id,
                             message,
                             {"contentType": "application/json", "contentEncoding": "utf-8"},
                         )
                     )
-
-                    self.metrics.pingback_responses_sent.increment()
 
             time.sleep(1)
 
@@ -415,11 +408,17 @@ class ServiceApp(app_base.AppBase):
 
         threads_to_launch = [
             app_base.WorkerThreadInfo(
-                self.eventhub_dispatcher_thread, "eventhub_dispatcher_thread"
+                self.dispatch_incoming_messages_thread, "dispatch_incoming_messages_thread"
             ),
-            app_base.WorkerThreadInfo(self.pairing_thread, "pairing_thread"),
-            app_base.WorkerThreadInfo(self.c2d_sender_thread, "c2d_sender_thread"),
-            app_base.WorkerThreadInfo(self.pingback_thread, "pingback_thread"),
+            app_base.WorkerThreadInfo(
+                self.handle_pairing_request_thread, "handle_pairing_request_thread"
+            ),
+            app_base.WorkerThreadInfo(
+                self.send_outgoing_c2d_messages_thread, "send_outgoing_c2d_messages_thread"
+            ),
+            app_base.WorkerThreadInfo(
+                self.handle_pingback_request_thread, "handle_pingback_request_thread"
+            ),
         ]
 
         self.run_threads(threads_to_launch)

@@ -19,9 +19,10 @@ from measurement import ThreadSafeCounter
 import azure_monitor
 from azure_monitor_metrics import MetricsReporter
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 logging.getLogger("paho").setLevel(level=logging.INFO)
 logging.getLogger("thief").setLevel(level=logging.INFO)
+logging.getLogger("aure.iot").setLevel(level=logging.WARNING)
 
 logger = logging.getLogger("thief.{}".format(__name__))
 
@@ -64,12 +65,10 @@ class DeviceRunMetrics(object):
         self.run_state = app_base.WAITING
         self.exit_reason = None
 
-        self.pingback_requests_sent = ThreadSafeCounter()
-        self.pingback_responses_received = ThreadSafeCounter()
-        self.d2c_unacked = ThreadSafeCounter()
-        self.d2c_sent = ThreadSafeCounter()
-        self.d2c_received_by_service_app = ThreadSafeCounter()
-        self.d2c_failed = ThreadSafeCounter()
+        self.send_message_count_unacked = ThreadSafeCounter()
+        self.send_message_count_sent = ThreadSafeCounter()
+        self.send_message_count_received_by_service_app = ThreadSafeCounter()
+        self.send_message_count_failures = ThreadSafeCounter()
 
 
 class DeviceRunConfig(object):
@@ -101,7 +100,7 @@ class DeviceRunConfig(object):
         # How many threads do we spin up for overlapped send_message calls.  These threads
         # pull messages off of a single outgoing queue.  If all of the send_message threads
         # are busy, outgoing messages will just pile up in the queue.
-        self.send_message_thread_count = 10
+        self.send_outgoing_messages_thread_count = 10
 
         # How long do we wait for notification that the service app received a
         # message before we consider it a failure?
@@ -145,7 +144,7 @@ class DeviceApp(app_base.AppBase):
         self.received_pingback_list = []
         self.new_pingback_event = threading.Event()
         # for telemetry
-        self.telemetry_queue = queue.Queue()
+        self.outgoing_send_message_queue = queue.Queue()
         # for metrics
         self.reporter = MetricsReporter()
         self._configure_azure_monitor_metrics()
@@ -184,32 +183,32 @@ class DeviceApp(app_base.AppBase):
             "bytes",
         )
         self.reporter.add_integer_measurement(
-            "total_messages_sent",
-            "totalMessagesSent",
+            "send_message_count_sent",
+            "sendMessageCountSent",
             "Count of messages sent and ack'd by the transport",
             "message(s)",
         )
         self.reporter.add_integer_measurement(
-            "total_messages_received_by_service",
-            "totalMessagesReceivedByService",
+            "send_message_count_received_by_service",
+            "sendMessageCountReceivedByService",
             "Count of messages sent to iothub with receipt verified via service sdk",
             "message(s)",
         )
         self.reporter.add_integer_measurement(
-            "messages_in_backlog",
-            "messagesInBacklog",
+            "send_message_count_in_backlog",
+            "sendMessageCountInBacklog",
             "Count of messages waiting to be sent",
             "message(s)",
         )
         self.reporter.add_integer_measurement(
-            "messages_unacked",
-            "messagesUnacked",
+            "send_message_count_unacked",
+            "sendMessageCountUnacked",
             "Count of messages sent to iothub but not ack'd by the transport",
             "message(s)",
         )
         self.reporter.add_integer_measurement(
-            "messages_not_received_by_service",
-            "messagesNotReceivedByService",
+            "send_message_count_not_received_by_service",
+            "sendMessageCountNotReceivedByService",
             "Count of messages sent to iothub and acked by the transport, but receipt not (yet) verified via service sdk",
             "message(s)",
         )
@@ -219,8 +218,8 @@ class DeviceApp(app_base.AppBase):
             datetime.datetime.now(datetime.timezone.utc) - self.metrics.run_start_utc
         )
 
-        sent = self.metrics.d2c_sent.get_count()
-        received_by_service = self.metrics.d2c_received_by_service_app.get_count()
+        sent = self.metrics.send_message_count_sent.get_count()
+        received_by_service = self.metrics.send_message_count_received_by_service_app.get_count()
 
         props = {
             "runStartUtc": self.metrics.run_start_utc.isoformat(),
@@ -228,12 +227,12 @@ class DeviceApp(app_base.AppBase):
             "runTime": str(self.metrics.run_time),
             "runState": str(self.metrics.run_state),
             "exitReason": self.metrics.exit_reason,
-            "totalMessagesSent": sent,
-            "totalMessagesReceivedByService": received_by_service,
-            "totalMessagesFailed": self.metrics.d2c_failed.get_count(),
-            "messagesInBacklog": self.telemetry_queue.qsize(),
-            "messagesUnacked": self.metrics.d2c_unacked.get_count(),
-            "messagesNotReceivedByService": sent - received_by_service,
+            "sendMessageCountSent": sent,
+            "sendMessageCountReceivedByService": received_by_service,
+            "sendMessageCountFailures": self.metrics.send_message_count_failures.get_count(),
+            "sendMessageCountInBacklog": self.outgoing_send_message_queue.qsize(),
+            "sendMessageCountUnacked": self.metrics.send_message_count_unacked.get_count(),
+            "sendMessageCountNotReceivedByService": sent - received_by_service,
         }
         return props
 
@@ -248,7 +247,7 @@ class DeviceApp(app_base.AppBase):
             "configPairingRequestTimeoutInterval": self.config.pairing_request_timeout_interval,
             "configPairingRequestSendInterval": self.config.pairing_request_send_interval,
             "configSendMessageOperationsPerSecond": self.config.send_message_operations_per_second,
-            "configSendMessageThreadCount": self.config.send_message_thread_count,
+            "configSendOutgoingMessagesThreadCount": self.config.send_outgoing_messages_thread_count,
             "configSendMessageArrivalFailureInterval": self.config.send_message_arrival_failure_interval,
             "configSendMessageArrivalFailureCount": self.config.send_message_arrival_failure_count,
             "configSendMessageBacklogFailureCount": self.config.send_message_backlog_failure_count,
@@ -263,7 +262,6 @@ class DeviceApp(app_base.AppBase):
         props = {"thief": self.get_longhaul_metrics()}
         props["thief"].update(self.get_fixed_system_metrics(azure.iot.device.constant.VERSION))
         props["thief"].update(self.get_longhaul_config_properties())
-        print("patching {}".format(props))
         self.client.patch_twin_reported_properties(props)
 
     def pair_with_service_instance(self):
@@ -354,40 +352,57 @@ class DeviceApp(app_base.AppBase):
                 self.pair_with_service_instance()
                 self.pair_request_trigger.clear()
 
-    def send_telemetry_thread(self, worker_thread_info):
+    def send_outgoing_messages_thread(self, worker_thread_info):
         """
         Thread which reads the telemetry queue and sends the telemetry.  Since send_message is
         blocking, and we want to overlap send_messsage calls, we create multiple
-        send_telemetry_therad instances so we can send multiple messages at the same time.
+        send_outgoing_messages_thread instances so we can send multiple messages at the same time.
 
-        The number of send_telemetry_thread instances is the number of overlapped sent operations
+        The number of send_outgoing_messages_thread instances is the number of overlapped sent operations
         we can have
         """
         while not self.done.isSet():
             worker_thread_info.watchdog_time = time.time()
             try:
-                msg = self.telemetry_queue.get(timeout=1)
+                msg = self.outgoing_send_message_queue.get(timeout=1)
             except queue.Empty:
                 msg = None
             if msg:
                 try:
-                    self.metrics.d2c_unacked.increment()
+                    self.metrics.send_message_count_unacked.increment()
                     self.client.send_message(msg)
                 except Exception as e:
-                    self.metrics.d2c_failed.increment()
+                    self.metrics.send_message_count_failures.increment()
                     logger.error("send_message raised {}".format(e), exc_info=True)
                 else:
-                    self.metrics.pingback_requests_sent.increment()
-                    self.metrics.d2c_sent.increment()
+                    self.metrics.send_message_count_sent.increment()
                 finally:
-                    self.metrics.d2c_unacked.decrement()
+                    self.metrics.send_message_count_unacked.decrement()
 
-    def test_d2c_thread(self, worker_thread_info):
+    def send_metrics_to_azure_monitor(self, props):
+        self.reporter.set_process_cpu_percent(props["processCpuPercent"])
+        self.reporter.set_process_working_set(props["processWorkingSet"])
+        self.reporter.set_process_bytes_in_all_heaps(props["processBytesInAllHeaps"])
+        self.reporter.set_process_private_bytes(props["processPrivateBytes"])
+        self.reporter.set_process_working_set_private(props["processCpuPercent"])
+
+        self.reporter.set_send_message_count_sent(props["sendMessageCountSent"])
+        self.reporter.set_send_message_count_received_by_service(
+            props["sendMessageCountReceivedByService"]
+        )
+        self.reporter.set_send_message_count_in_backlog(props["sendMessageCountInBacklog"])
+        self.reporter.set_send_message_count_unacked(props["sendMessageCountUnacked"])
+        self.reporter.set_send_message_count_not_received_by_service(
+            props["sendMessageCountNotReceivedByService"]
+        )
+        self.reporter.record()
+
+    def test_send_message_thread(self, worker_thread_info):
         """
         Thread to continuously send d2c messages throughout the longhaul run.  This thread doesn't
         actually send messages becauase send_message is blocking and we want to overlap our send
         operations.  Instead, this thread adds the messsage to a queue, and relies on a
-        send_telemetry_thread instance to actually send the message.
+        send_outgoing_messages_thread instance to actually send the message.
         """
 
         while not self.done.isSet():
@@ -403,21 +418,7 @@ class DeviceApp(app_base.AppBase):
             props["thief"].update(system_health)
 
             # push these same metrics to Azure Monitor
-            self.reporter.set_process_cpu_percent(system_health["processCpuPercent"])
-            self.reporter.set_process_working_set(system_health["processWorkingSet"])
-            self.reporter.set_process_bytes_in_all_heaps(system_health["processBytesInAllHeaps"])
-            self.reporter.set_process_private_bytes(system_health["processPrivateBytes"])
-            self.reporter.set_process_working_set_private(system_health["processCpuPercent"])
-            self.reporter.set_total_messages_sent(longhaul_metrics["totalMessagesSent"])
-            self.reporter.set_total_messages_received_by_service(
-                longhaul_metrics["totalMessagesReceivedByService"]
-            )
-            self.reporter.set_messages_in_backlog(longhaul_metrics["messagesInBacklog"])
-            self.reporter.set_messages_unacked(longhaul_metrics["messagesUnacked"])
-            self.reporter.set_messages_not_received_by_service(
-                longhaul_metrics["messagesNotReceivedByService"]
-            )
-            self.reporter.record()
+            self.send_metrics_to_azure_monitor(props["thief"])
 
             msg = Message(json.dumps(props))
             msg.content_type = "application/json"
@@ -428,7 +429,7 @@ class DeviceApp(app_base.AppBase):
             msg.custom_properties["serviceAppRunId"] = self.service_app_run_id
 
             def on_pingback_received(pingback_id):
-                self.metrics.d2c_received_by_service_app.increment()
+                self.metrics.send_message_count_received_by_service_app.increment()
 
             with self.pingback_list_lock:
                 self.pingback_wait_list[pingback_id] = MessageWaitingToArrive(
@@ -440,7 +441,7 @@ class DeviceApp(app_base.AppBase):
 
             # This function only queues the message.  A send_telemetry_thread instance will pick
             # it up and send it.
-            self.telemetry_queue.put(msg)
+            self.outgoing_send_message_queue.put(msg)
 
             # sleep until we need to send again
             self.done.wait(1 / self.config.send_message_operations_per_second)
@@ -466,7 +467,7 @@ class DeviceApp(app_base.AppBase):
 
             self.done.wait(self.config.thief_property_update_interval)
 
-    def dispatch_c2d_thread(self, worker_thread_info):
+    def dispatch_incoming_message_thread(self, worker_thread_info):
         """
         Thread which continuously receives c2d messages throughout the test run.  This
         thread does minimal processing for each c2d.  If anything complex needs to happen as a
@@ -482,7 +483,6 @@ class DeviceApp(app_base.AppBase):
                 thief = obj.get("thief")
                 cmd = thief.get("cmd") if thief else None
                 if cmd == "pingbackResponse":
-                    self.metrics.pingback_responses_received.increment()
                     list = thief.get("pingbacks")
                     if list:
                         with self.pingback_list_lock:
@@ -492,12 +492,9 @@ class DeviceApp(app_base.AppBase):
                 else:
                     logger.warning("Unknown command received: {}".format(obj))
 
-    def handle_pingback_thread(self, worker_thread_info):
+    def handle_pingback_response_thread(self, worker_thread_info):
         """
-        Thread which resolves the pingback_wait_list (messages waiting for pingback) with the
-        received_pingback_list (pingbacks that we've received) so we can do pingback callbacks.
-        We do this in our own thread because we don't wat to make c2d_dispatcher_thread wait
-        while we do callbacks.
+        Thread which handles incoming pingback responses.
         """
 
         while not self.done.isSet():
@@ -525,7 +522,7 @@ class DeviceApp(app_base.AppBase):
 
             self.new_pingback_event.wait(timeout=1)
 
-    def failure_metric_watcher_thread(self, worker_thread_info):
+    def check_for_failure_thread(self, worker_thread_info):
         """
         Thread which is responsible for watching for test failures based on limits that are
         exceeded.
@@ -566,31 +563,35 @@ class DeviceApp(app_base.AppBase):
                     )
                 )
 
-            if self.telemetry_queue.qsize() > self.config.send_message_backlog_failure_count:
+            if (
+                self.outgoing_send_message_queue.qsize()
+                > self.config.send_message_backlog_failure_count
+            ):
                 raise Exception(
                     "send_message backlog with {} items exceeded maxiumum count of {} items".format(
-                        self.telemetry_queue.qsize(), self.config.send_message_backlog_failure_count
+                        self.outgoing_send_message_queue.qsize(),
+                        self.config.send_message_backlog_failure_count,
                     )
                 )
 
             if (
-                self.metrics.d2c_unacked.get_count()
+                self.metrics.send_message_count_unacked.get_count()
                 > self.config.send_message_unacked_failure_count
             ):
                 raise Exception(
                     "unacked message count  of with {} items exceeded maxiumum count of {} items".format(
-                        self.metrics.d2c_unacked.get_count,
+                        self.metrics.send_message_count_unacked.get_count,
                         self.config.send_message_unacked_failure_count,
                     )
                 )
 
             if (
-                self.metrics.d2c_failed.get_count()
+                self.metrics.send_message_count_failures.get_count()
                 > self.config.send_message_exception_failure_count
             ):
                 raise Exception(
                     "send_message failure count of {} exceeds maximum count of {} failures".format(
-                        self.metrics.d2c_failed.get_count(),
+                        self.metrics.send_message_count_failures.get_count(),
                         self.config.send_message_exception_failure_count,
                     )
                 )
@@ -617,20 +618,23 @@ class DeviceApp(app_base.AppBase):
 
         # Make a list of threads to launch
         worker_thread_infos = [
-            app_base.WorkerThreadInfo(self.dispatch_c2d_thread, "c2d_dispatch_thread"),
+            app_base.WorkerThreadInfo(
+                self.dispatch_incoming_message_thread, "dispatch_incoming_message_thread"
+            ),
             app_base.WorkerThreadInfo(
                 self.update_thief_properties_thread, "update_thief_properties_thread"
             ),
-            app_base.WorkerThreadInfo(self.handle_pingback_thread, "handle_pingback_thread"),
-            app_base.WorkerThreadInfo(self.test_d2c_thread, "test_d2c_thead"),
             app_base.WorkerThreadInfo(
-                self.failure_metric_watcher_thread, "failure_metric_watcher_thread"
+                self.handle_pingback_response_thread, "handle_pingback_response_thread"
             ),
+            app_base.WorkerThreadInfo(self.test_send_message_thread, "test_send_message_thread"),
+            app_base.WorkerThreadInfo(self.check_for_failure_thread, "check_for_failure_thread"),
         ]
-        for i in range(0, self.config.send_message_thread_count):
+        for i in range(0, self.config.send_outgoing_messages_thread_count):
             worker_thread_infos.append(
                 app_base.WorkerThreadInfo(
-                    self.send_telemetry_thread, "send_telemetry_thread #{}".format(i)
+                    self.send_outgoing_messages_thread,
+                    "send_outgoing_messages_thread #{}".format(i),
                 )
             )
 
