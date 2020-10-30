@@ -49,7 +49,7 @@ azure_monitor.log_to_azure_monitor("azure")
 azure_monitor.log_to_azure_monitor("paho")
 
 MessageWaitingToArrive = collections.namedtuple(
-    "MessageWaitingToArrive", "callback pingback_id message send_time"
+    "MessageWaitingToArrive", "callback pingback_id message send_epochtime"
 )
 
 
@@ -148,7 +148,8 @@ class DeviceApp(app_base.AppBase):
         self.reporter = MetricsReporter()
         self._configure_azure_monitor_metrics()
         # for pairing
-        self.pair_request_trigger = threading.Event()
+        self.incoming_pairing_message_queue = queue.Queue()
+        self.pairing_id = None
 
     def _configure_azure_monitor_metrics(self):
         self.reporter.add_float_measurement(
@@ -263,99 +264,113 @@ class DeviceApp(app_base.AppBase):
         props["thief"].update(self.get_longhaul_config_properties())
         self.client.patch_twin_reported_properties(props)
 
-    def pair_with_service_instance(self):
+    def pairing_thread(self, worker_thread_info):
         """
         "pair" with a service app. This is necessary because we can have a single
         service app responsible for multiple device apps.  The pairing process works
         like this:
 
-        1. The device sets reported properties saying that it isn't paired and also any
-            perferences it has about it's prospective partner.
-        2. The device app sends a "pairingRequest" d2c message.
-        3. All service apps watch for all pairingRequest messages.  If some service app instance
-            wants to get paired with a device, it sets a desired property to indicate that it's
-            available.  If multiple service apps set the property, the winner is chosen by the
-            device app, probably based on whatever value happens to be in the desired property
-            when the device app checks.
-        4. Once the device decides on a service app, it sets it's serviceAppRunId reported
-            property. It also sets the serviceAppRunId property in any telemetry messages it
-            sends.
+        1. The device sends a pairingRequest message stating what perferences it has about its
+             prospective partner along with a pairingId value that we can use to discriminate
+             this partnership with other (previous) pairings.
+
+        2. All service apps watch for all pairingRequest messages.  If some service app instance
+            wants to get paired with a device, it sends a pairingResponse message to the device.
+
+            If multiple service apps send the message, the winner is chosen by the
+            device app, probably based on what message comes in first.
+
+        3. Once the device decides on a service app, it sets serviceAppRunId and pairingId
+            in all messages it sends.  When the service sees this value, it can know whether
+            it was chosen by the device.
 
         Right now, there is no provision for a failing service app.  In the future, the device
         code _could_ see that the service app isn't responding and start the pairing process
         over again.
         """
 
-        # pairing ID is used to distinguish this pairingRequest from any previous pairingRequests
-        # which may have been handled in the past.
-        pairing_id = str(uuid.uuid4())
-
-        reported_properties = {
-            "thief": {
-                "serviceAppRunId": None,
-                "requestedServicePool": requested_service_pool,
-                "pairingId": pairing_id,
-            }
-        }
-        logger.info(
-            "Attempting to pair with service instance.  Setting reported properties: {}".format(
-                reported_properties
-            )
-        )
-        self.client.patch_twin_reported_properties(reported_properties)
-
-        logger.info("sending pairingRequest message")
-        pairing_request_message = Message(json.dumps({"thief": {"cmd": "pairingRequest"}}))
-        pairing_request_message.content_type = "application/json"
-        pairing_request_message.content_encoding = "utf-8"
-        self.client.send_message(pairing_request_message)
-
-        start_time = time.time()
-        while time.time() - start_time < self.config.pairing_request_timeout_interval:
-            logger.info("Waiting for service app to claim this device")
-            patch = self.client.receive_twin_desired_properties_patch(
-                timeout=self.config.pairing_request_send_interval
-            )
-
-            if patch and "thief" in patch:
-                logger.info("Got patch")
-                thief = patch["thief"]
-                service_app_run_id = thief.get("serviceAppRunId", None)
-                if (thief.get("pairingId", None) == pairing_id) and service_app_run_id:
-                    logger.info(
-                        "Service app {} claimed this device instance".format(service_app_run_id)
-                    )
-                    self.service_app_run_id = service_app_run_id
-                    reported_properties["thief"]["serviceAppRunId"] = service_app_run_id
-                    self.client.patch_twin_reported_properties(reported_properties)
-                    return
-                else:
-                    logger.info("patch received, but serviceAppRunId not set")
-
-            logger.info("Still no assigned service instance. Sending new pairingRequest message")
-            self.client.send_message(pairing_request_message)
-
-        raise Exception("timeout waitig for service to set serviceAppRunId")
-
-    def pairing_thread(self, worker_thread_info):
+        currently_pairing = False
+        pairing_start_epochtime = 0
+        pairing_last_request_epochtime = 0
 
         while not self.done.isSet():
-            worker_thread_info.watchdog_time = time.time()
+            worker_thread_info.watchdog_epochtime = time.time()
 
-            self.pair_request_trigger.wait(timeout=10)
+            try:
+                msg = self.incoming_pairing_message_queue.get(timeout=1)
+            except queue.Empty:
+                msg = None
 
-            if self.pair_request_trigger.isSet():
-                logger.info(
-                    "pairing_thread: pair_request_trigger is set.  Starting pairing process"
-                )
-                self.pair_with_service_instance()
-                self.pair_request_trigger.clear()
+            # We trigger a pairing operation by pushing this string into our incoming queue.
+            # Not a great design, but it lets us group this functionality into a single thread
+            # without adding another signalling mechanism.
+            if msg == "START_PAIRING":
+                logger.info("Starting pairing operation")
+                currently_pairing = True
+                pairing_start_epochtime = time.time()
+                pairing_last_request_epochtime = 0
+                self.pairing_id = str(uuid.uuid4())
+                self.service_run_app_id = None
+                # set msg to None to trigger the block that sends the first pairingRequest message
+                msg = None
+
+            if not msg and currently_pairing:
+                if (
+                    time.time() - pairing_start_epochtime
+                ) > self.config.pairing_request_timeout_interval:
+                    raise Exception(
+                        "No resopnse to pairing requests after trying for {} seconds".format(
+                            self.config.pairing_request_timeout_interval
+                        )
+                    )
+
+                elif (
+                    time.time() - pairing_last_request_epochtime
+                ) > self.config.pairing_request_send_interval:
+
+                    logger.info("sending pairingRequest message")
+                    pairing_request_message = Message(
+                        json.dumps(
+                            {
+                                "thief": {
+                                    "cmd": "pairingRequest",
+                                    "requestedServicePool": requested_service_pool,
+                                    "pairingId": self.pairing_id,
+                                }
+                            }
+                        )
+                    )
+
+                    pairing_request_message.content_type = "application/json"
+                    pairing_request_message.content_encoding = "utf-8"
+                    self.outgoing_send_message_queue.put(pairing_request_message)
+                    pairing_last_request_epochtime = time.time()
+
+            elif msg:
+                if currently_pairing:
+                    thief = json.loads(msg.data.decode()).get("thief")
+                    if thief["cmd"] == "pairingResponse":
+                        service_app_run_id = thief["serviceAppRunId"]
+                        logger.info(
+                            "Service app {} claimed this device instance".format(service_app_run_id)
+                        )
+                        self.service_app_run_id = service_app_run_id
+                        currently_pairing = False
+
+                else:
+                    logger.info("Ignoring pairing response: {}".format(msg.data.decode()))
+
+    def start_pairing(self):
+        """
+        trigger the pairing process
+        """
+        self.incoming_pairing_message_queue.put("START_PAIRING")
 
     def is_pairing_complete(self):
         """
         return True if the pairing process is complete
         """
-        return True if self.service_app_run_id else False
+        return self.pairing_id and self.service_app_run_id
 
     def send_message_thread(self, worker_thread_info):
         """
@@ -369,7 +384,7 @@ class DeviceApp(app_base.AppBase):
         while not self.done.isSet():
             # We do not check is_pairing_complete here because we use this thread to
             # send pairing requests.
-            worker_thread_info.watchdog_time = time.time()
+            worker_thread_info.watchdog_epochtime = time.time()
             try:
                 msg = self.outgoing_send_message_queue.get(timeout=1)
             except queue.Empty:
@@ -413,7 +428,7 @@ class DeviceApp(app_base.AppBase):
         """
 
         while not self.done.isSet():
-            worker_thread_info.watchdog_time = time.time()
+            worker_thread_info.watchdog_epochtime = time.time()
 
             if self.is_pairing_complete():
                 pingback_id = str(uuid.uuid4())
@@ -426,6 +441,7 @@ class DeviceApp(app_base.AppBase):
                         "cmd": "pingbackRequest",
                         "pingbackId": pingback_id,
                         "serviceAppRunId": self.service_app_run_id,
+                        "pairingId": self.pairing_id,
                     }
                 }
                 props["thief"].update(longhaul_metrics)
@@ -440,7 +456,6 @@ class DeviceApp(app_base.AppBase):
                 msg.custom_properties["eventDateTimeUtc"] = datetime.datetime.now(
                     datetime.timezone.utc
                 ).isoformat()
-                msg.custom_properties["serviceAppRunId"] = self.service_app_run_id
 
                 def on_pingback_received(pingback_id):
                     self.metrics.send_message_count_received_by_service_app.increment()
@@ -450,7 +465,7 @@ class DeviceApp(app_base.AppBase):
                         callback=on_pingback_received,
                         pingback_id=pingback_id,
                         message=msg,
-                        send_time=time.time(),
+                        send_epochtime=time.time(),
                     )
 
                 # This function only queues the message.  A send_message_thread instance will pick
@@ -472,7 +487,7 @@ class DeviceApp(app_base.AppBase):
         done = False
 
         while not done:
-            worker_thread_info.watchdog_time = time.time()
+            worker_thread_info.watchdog_epochtime = time.time()
             # setting this at the begining and checking at the end guarantees one last update
             # before the thread dies
             if self.done.isSet():
@@ -493,17 +508,19 @@ class DeviceApp(app_base.AppBase):
         to pick up.
         """
         while not self.done.isSet():
-            worker_thread_info.watchdog_time = time.time()
+            worker_thread_info.watchdog_epochtime = time.time()
             msg = self.client.receive_message(timeout=1)
 
             if msg:
                 obj = json.loads(msg.data.decode())
                 thief = obj.get("thief")
 
-                if thief:
+                if thief and thief["pairingId"] == self.pairing_id:
                     cmd = thief["cmd"]
                     if cmd == "pingbackResponse":
                         self.incoming_pingback_response_queue.put(msg)
+                    elif cmd == "pairingResponse":
+                        self.incoming_pairing_message_queue.put(msg)
                     else:
                         logger.warning("Unknown command received: {}".format(obj))
 
@@ -516,7 +533,7 @@ class DeviceApp(app_base.AppBase):
         """
 
         while not self.done.isSet():
-            worker_thread_info.watchdog_time = time.time()
+            worker_thread_info.watchdog_epochtime = time.time()
 
             try:
                 msg = self.incoming_pingback_response_queue.get(timeout=1)
@@ -559,19 +576,19 @@ class DeviceApp(app_base.AppBase):
        """
 
         while not self.done.isSet():
-            worker_thread_info.watchdog_time = time.time()
+            worker_thread_info.watchdog_epochtime = time.time()
 
             arrival_failure_count = 0
             now = time.time()
             with self.pingback_list_lock:
                 for message_waiting in self.pingback_wait_list.values():
                     if (
-                        now - message_waiting.send_time
+                        now - message_waiting.send_epochtime
                     ) > self.config.send_message_arrival_failure_interval:
                         logger.warning(
                             "arrival time for {} of {} seconds is longer than failure interval of {}".format(
                                 message_waiting.pingback_id,
-                                (now - message_waiting.send_time),
+                                (now - message_waiting.send_epochtime),
                                 self.config.send_message_arrival_failure_interval,
                             )
                         )
@@ -635,7 +652,7 @@ class DeviceApp(app_base.AppBase):
         self.update_initial_reported_properties()
 
         # pair with a service app instance
-        self.pair_with_service_instance()
+        self.start_pairing()
 
         # Make a list of threads to launch
         worker_thread_infos = [
@@ -650,6 +667,7 @@ class DeviceApp(app_base.AppBase):
             ),
             app_base.WorkerThreadInfo(self.test_send_message_thread, "test_send_message_thread"),
             app_base.WorkerThreadInfo(self.check_for_failure_thread, "check_for_failure_thread"),
+            app_base.WorkerThreadInfo(self.pairing_thread, "pairing_thread"),
         ]
         for i in range(0, self.config.send_message_thread_count):
             worker_thread_infos.append(

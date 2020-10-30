@@ -29,7 +29,7 @@ class WorkerThreadInfo(object):
         self.threadproc = threadproc
         self.name = name
         self.future = None
-        self.watchdog_time = None
+        self.watchdog_epochtime = None
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -71,9 +71,9 @@ class AppBase(object):
         for worker in threads_to_launch:
             logger.info("Launching {}".format(worker.name))
             worker.future = self.executor.submit(worker.threadproc, worker)
-            worker.watchdog_time = time.time()
+            worker.watchdog_epochtime = time.time()
 
-        loop_start_time = time.time()
+        loop_start_epochtime = time.time()
         while self.metrics.run_state == RUNNING:
             # Check all of our threads for failure, unexpected condition, or watchdog timeout
             for worker in threads_to_launch:
@@ -102,10 +102,12 @@ class AppBase(object):
                     self.metrics.run_state = FAILED
                     self.metrics.exit_reason = str(error)
 
-                elif time.time() - worker.watchdog_time > self.config.watchdog_failure_interval:
+                elif (
+                    time.time() - worker.watchdog_epochtime > self.config.watchdog_failure_interval
+                ):
                     error = Exception(
                         "Future {} has not responded for {} seconds.  Failing".format(
-                            worker.name, time.time() - worker.watchdog_time
+                            worker.name, time.time() - worker.watchdog_epochtime
                         )
                     )
                     worker.future = None
@@ -116,7 +118,7 @@ class AppBase(object):
             if self.metrics.run_state == RUNNING:
 
                 if self.config.max_run_duration and (
-                    time.time() - loop_start_time > self.config.max_run_duration
+                    time.time() - loop_start_epochtime > self.config.max_run_duration
                 ):
                     self.metrics.run_state = COMPLETE
                     self.metrics.exit_rason = "Run passed after {}".format(
@@ -134,9 +136,9 @@ class AppBase(object):
         self.pre_shutdown()
         logger.info("Waiting up to 60 seconds for  all threads to exit")
 
-        wait_start = time.time()
+        wait_start_epochtime = time.time()
         running_threads = list(threads_to_launch)
-        while len(running_threads) and (time.time() - wait_start < 60):
+        while len(running_threads) and (time.time() - wait_start_epochtime < 60):
             new_list = []
             for worker in running_threads:
                 if not worker.future:
