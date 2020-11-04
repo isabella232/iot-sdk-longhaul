@@ -167,9 +167,13 @@ class ServiceApp(app_base.AppBase):
                 logger.info("attempting to pair with device {}".format(device_id))
 
                 body = event.body_as_json()
-                thief = body.get("thief")
+                thief = body.get("thief", None)
+                if not thief:
+                    continue
 
                 pairing_id = thief.get("pairingId", None)
+                if not pairing_id:
+                    continue
 
                 # Maybe the device app wants an instance from a specific pool.  If we're not
                 # in that pool. we can stop

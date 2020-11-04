@@ -29,12 +29,10 @@ logging.getLogger("azure.iot").setLevel(level=logging.INFO)
 logger = logging.getLogger("thief.{}".format(__name__))
 
 # TODO: exit service when device stops responding
-# TODO: add more try/catch to service
-# TODO: add watchdog warnings
 # TODO: add code to receive rest of pingacks at end.  wait for delta since last to be > 20 seconds.
 # TODO: add config for "how long must a message be missing before we consider it actually missing".
 # TODO: add device_id to service logs as extra parameter
-# TODO: decide if config values should be failure_count or allowed_failures?
+# TODO: add code to update desired properties when unpairing device.
 
 # use os.environ[] for required environment variables
 provisioning_host = os.environ["THIEF_DEVICE_PROVISIONING_HOST"]
@@ -120,18 +118,18 @@ class DeviceRunConfig(object):
 
         # How many messages fail to arrive at the service before we fail the test
         # This counts messages that have been sent and acked, but the service app hasn't reported receipt.
-        self.send_message_arrival_failure_count = 10
+        self.send_message_arrival_allowed_failure_count = 10
 
         # How many messages to we allow in the send_message backlog before we fail the test.
         # This counts messages that gets backed up because send_message hasn't even been called yet.
-        self.send_message_backlog_failure_count = 200
+        self.send_message_backlog_allowed_failure_count = 200
 
         # How many unack'ed messages do we allow before we fail the test?
         # This counts messages that either haven't been sent, or they've been sent but not ack'ed by the receiver
-        self.send_message_unacked_failure_count = 200
+        self.send_message_unacked_allowed_failure_count = 200
 
         # How many send_message exceptions do we allow before we fail the test?
-        self.send_message_exception_failure_count = 1
+        self.send_message_exception_allowed_failure_count = 10
 
         # How often do we want the service to send test C2D messages?
         self.receive_message_interval_in_seconds = 2
@@ -140,7 +138,7 @@ class DeviceRunConfig(object):
         self.receive_message_filler_size = 16 * 1024
 
         # How many missing C2D messages will cause the test to fail?
-        self.receive_message_missing_message_failure_count = 10
+        self.receive_message_missing_message_allowed_failure_count = 10
 
 
 class DeviceApp(app_base.AppBase):
@@ -294,13 +292,13 @@ class DeviceApp(app_base.AppBase):
             "configSendMessageOperationsPerSecond": self.config.send_message_operations_per_second,
             "configSendMessageThreadCount": self.config.send_message_thread_count,
             "configSendMessageArrivalFailureIntervalInSeconds": self.config.send_message_arrival_failure_interval_in_seconds,
-            "configSendMessageArrivalFailureCount": self.config.send_message_arrival_failure_count,
-            "configSendMessageBacklogFailureCount": self.config.send_message_backlog_failure_count,
-            "configSendMessageUnackedFailureCount": self.config.send_message_unacked_failure_count,
-            "configSendMessageExceptionFailureCount": self.config.send_message_exception_failure_count,
+            "configSendMessageArrivalAllowedFailureCount": self.config.send_message_arrival_allowed_failure_count,
+            "configSendMessageBacklogAllowedFailureCount": self.config.send_message_backlog_allowed_failure_count,
+            "configSendMessageUnackedAllowedFailureCount": self.config.send_message_unacked_allowed_failure_count,
+            "configSendMessageExceptionAllowedFailureCount": self.config.send_message_exception_allowed_failure_count,
             "configReceiveMessageIntervalInSeconds": self.config.receive_message_interval_in_seconds,
             "configReceiveMessageFillerSize": self.config.receive_message_filler_size,
-            "configReceiveMessageMissingMessageFailureCount": self.config.receive_message_missing_message_failure_count,
+            "configReceiveMessageMissingMessageAllowedFailureCount": self.config.receive_message_missing_message_allowed_failure_count,
         }
 
     def update_initial_reported_properties(self):
@@ -665,54 +663,54 @@ class DeviceApp(app_base.AppBase):
                         )
                         arrival_failure_count += 1
 
-            if arrival_failure_count > self.config.send_message_arrival_failure_count:
+            if arrival_failure_count > self.config.send_message_arrival_allowed_failure_count:
                 raise Exception(
                     "count of failed arrivals of {} is greater than maximum count of {}".format(
-                        arrival_failure_count, self.config.send_message_arrival_failure_count
+                        arrival_failure_count, self.config.send_message_arrival_allowed_failure_count
                     )
                 )
 
             if (
                 self.outgoing_send_message_queue.qsize()
-                > self.config.send_message_backlog_failure_count
+                > self.config.send_message_backlog_allowed_failure_count
             ):
                 raise Exception(
                     "send_message backlog with {} items exceeded maxiumum count of {} items".format(
                         self.outgoing_send_message_queue.qsize(),
-                        self.config.send_message_backlog_failure_count,
+                        self.config.send_message_backlog_allowed_failure_count,
                     )
                 )
 
             if (
                 self.metrics.send_message_count_unacked.get_count()
-                > self.config.send_message_unacked_failure_count
+                > self.config.send_message_unacked_allowed_failure_count
             ):
                 raise Exception(
                     "unacked message count  of with {} items exceeded maxiumum count of {} items".format(
                         self.metrics.send_message_count_unacked.get_count,
-                        self.config.send_message_unacked_failure_count,
+                        self.config.send_message_unacked_allowed_failure_count,
                     )
                 )
 
             if (
                 self.metrics.send_message_count_failures.get_count()
-                > self.config.send_message_exception_failure_count
+                > self.config.send_message_exception_allowed_failure_count
             ):
                 raise Exception(
                     "send_message failure count of {} exceeds maximum count of {} failures".format(
                         self.metrics.send_message_count_failures.get_count(),
-                        self.config.send_message_exception_failure_count,
+                        self.config.send_message_exception_allowed_failure_count,
                     )
                 )
 
             if (
                 self.out_of_order_message_tracker.get_missing_count()
-                > self.config.receive_message_missing_message_failure_count
+                > self.config.receive_message_missing_message_allowed_failure_count
             ):
                 raise Exception(
                     "missing received message count of {} exceeds maximum count of {} missing".format(
                         self.out_of_order_message_tracker.get_missing_count(),
-                        self.config.receive_message_missing_message_failure_count,
+                        self.config.receive_message_missing_message_allowed_failure_count,
                     )
                 )
 
