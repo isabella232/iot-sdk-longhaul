@@ -103,7 +103,8 @@ class AppBase(object):
                     self.metrics.exit_reason = str(error)
 
                 elif (
-                    time.time() - worker.watchdog_epochtime > self.config.watchdog_failure_interval
+                    time.time() - worker.watchdog_epochtime
+                    > self.config.watchdog_failure_interval_in_seconds
                 ):
                     error = Exception(
                         "Future {} has not responded for {} seconds.  Failing".format(
