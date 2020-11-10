@@ -41,20 +41,23 @@ class OutOfOrderMessageTracker(object):
         """
 
         with self.lock:
-            self.unresolved_indices.add(index)
-
             if index > self.max_received_index:
                 self.max_received_index = index
 
             if self.max_resolved_index is None:
                 self.max_resolved_index = index - 1
 
-            while len(self.unresolved_indices):
-                if (self.max_resolved_index + 1) in self.unresolved_indices:
-                    self.max_resolved_index += 1
-                    self.unresolved_indices.remove(self.max_resolved_index)
-                else:
-                    break
+            # since we're qos=1, we can get a c2d more than once
+            # This is why we compare to max_resolved_index
+            if index > self.max_resolved_index:
+                self.unresolved_indices.add(index)
+
+                while len(self.unresolved_indices):
+                    if (self.max_resolved_index + 1) in self.unresolved_indices:
+                        self.max_resolved_index += 1
+                        self.unresolved_indices.remove(self.max_resolved_index)
+                    else:
+                        break
 
         logger.info(
             "After adding {}, received={}, resolved={}, unresolved={}".format(

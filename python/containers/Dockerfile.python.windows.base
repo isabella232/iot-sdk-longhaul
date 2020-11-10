@@ -1,8 +1,8 @@
 ARG BASE=python:3.8.5-windowsservercore-1809
 FROM ${BASE}
 
-COPY device/requirements.txt \requirements-device.txt
-COPY service/requirements.txt \requirements-service.txt
+COPY python/device/requirements.txt \requirements-device.txt
+COPY python/service/requirements.txt \requirements-service.txt
 
 RUN pip install -r \requirements-device.txt \
     && pip install -r \requirements-service.txt \

@@ -4,7 +4,7 @@
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 
-source ${script_dir}/fetch-functions.sh
+source ${script_dir}/_fetch-functions.sh
 
 echo Fetching secrets
 get-secret THIEF_DEVICE_PROVISIONING_HOST THIEF-DEVICE-PROVISIONING-HOST

@@ -1,0 +1,54 @@
+# Copyright (c) Microsoft. All rights reserved.
+# Licensed under the MIT license. See LICENSE file in the project root for
+# full license information.
+set -e
+
+if [ "${BASH_SOURCE-}" = "$0" ]; then
+    echo "You must source this script: \$ source $0" >&2
+    return 33
+fi
+
+export PLATFORM=linux
+while [ "$1" != "" ]; do
+    arg=$1
+    shift
+    case "$arg" in
+        "-p" | "--platform")
+            export PLATFORM=$1
+            shift
+            ;;
+        "-L" | "--language")
+            export LANGUAGE_SHORT_NAME=$1
+            shift
+            ;;
+        "-l" | "--library")
+            export LIBRARY=$1
+            shift
+            ;;
+        "-s" | "--source")
+            export LIBRARY_SOURCE=$1
+            shift
+            ;;
+        "-v" | "--version")
+            export LIBRARY_VERSION=$1
+            shift
+            ;;
+        "-p" | "--pool")
+            export SERVICE_POOL=$1
+            shift
+            ;;
+        "-d" | "--device_id")
+            export DEVICE_ID=$1
+            shift
+            ;;
+        "-t" | "--tag")
+            export EXTRA_TAG=$1
+            shift
+            ;;
+        *)
+            echo "arg $arg is unkonwn"
+            return 33
+            ;;
+    esac
+done
+

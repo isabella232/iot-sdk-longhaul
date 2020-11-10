@@ -1,0 +1,113 @@
+# Copyright (c) Microsoft. All rights reserved.
+# Licensed under the MIT license. See LICENSE file in the project root for
+# full license information.
+set -e
+
+if [ "${BASH_SOURCE-}" = "$0" ]; then
+    echo "You must source this script: \$ source $0" >&2
+    return 33
+fi
+script_dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
+
+export ALL_LINUX_LANGUAGES="py27 py35 py36 py37 py38"
+export ALL_WINDOWS_LANGUAGES="py37 py38"
+
+if [ "$#" -eq 0 ]; then
+    return 0
+fi
+
+PLATFORM=$1
+LANGUAGE_SHORT_NAME=$2
+
+case "${LANGUAGE_SHORT_NAME}" in
+    py27)
+        export LANGUAGE=python
+        export PYTHON_SHORT_VERSION=27
+        export PYTHON_LONG_VERSION=2.7.18
+        ;;
+    py35)
+        export LANGUAGE=python
+        export PYTHON_SHORT_VERSION=35
+        export PYTHON_LONG_VERSION=3.5.9
+        ;;
+    py36)
+        export LANGUAGE=python
+        export PYTHON_SHORT_VERSION=36
+        export PYTHON_LONG_VERSION=3.6.12
+        ;;
+    py37)
+        export LANGUAGE=python
+        export PYTHON_SHORT_VERSION=37
+        export PYTHON_LONG_VERSION=3.7.9
+        ;;
+    py38)
+        export LANGUAGE=python
+        export PYTHON_SHORT_VERSION=38
+        export PYTHON_LONG_VERSION=3.8.5
+        ;;
+    *)
+        echo "FATAL: LANGUAGE_SHORT_NAME=${LANGUAGE_SHORT_NAME} unknown"
+        return 1
+        ;;
+esac
+
+case "${PLATFORM}" in 
+    linux)
+        case "${LANGUAGE_SHORT_NAME}" in 
+            py27|py35|py36|py37|py38)
+                ;;
+            *)
+                echo "FATAL ${LANGUAGE_SHORT_NAME} not suported for ${PLATFORM}"
+                return 1
+                ;;
+        esac
+        ;;
+    windows)
+        case "${LANGUAGE_SHORT_NAME}" in 
+            py37|py38)
+                ;;
+            *)
+                echo "FATAL ${LANGUAGE_SHORT_NAME} not suported for ${PLATFORM}"
+                return 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "FATAL PLATFORM=${PLATFORM} unknown"
+        return 1
+        ;;
+esac
+
+
+case "$LANGUAGE" in
+    python)
+        export BASE_DOCKER_IMAGE_NAME="py${PYTHON_SHORT_VERSION}-${PLATFORM}-base"
+        export BASE_DOCKER_DOCKERFILE="python/containers/Dockerfile.python.${PLATFORM}.base"
+
+        if [ "${PLATFORM}" == "linux" ]; then
+            export BASE_DOCKER_BUILD_ARGS="--build-arg BASE='python:${PYTHON_LONG_VERSION}-slim-buster'"
+        elif [ "${PLATFORM}" == "windows" ]; then
+            export BASE_DOCKER_BUILD_ARGS="--build-arg BASE='python:${PYTHON_LONG_VERSION}-windowservcercore-1809"
+        else
+            echo "FATAL: PLATFORM=${PLATFORM} unknown"
+            return 1
+        fi
+        ;;
+    *)
+        echo "FATAL: LANGUAGE='${LANGUAGE}' unknown"
+        return 1
+        ;;
+esac
+
+case "$LANGUAGE" in
+    python)
+        if [ "${LIBRARY_SOURCE}" == "" ]; then
+            export LIBRARY_SOURCE="pypi"
+        fi
+        ;;
+    *)
+        echo "FATAL: LANGUAGE='${LANGUAGE}' unknown"
+        return 1
+        ;;
+esac
+

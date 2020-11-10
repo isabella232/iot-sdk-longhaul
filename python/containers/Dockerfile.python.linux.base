@@ -8,8 +8,8 @@ RUN apt-get update \
         jq \
     && rm -rf /var/lib/apt/lists/*
 
-COPY device/requirements.txt /requirements-device.txt
-COPY service/requirements.txt /requirements-service.txt
+COPY python/device/requirements.txt /requirements-device.txt
+COPY python/service/requirements.txt /requirements-service.txt
 
 RUN apt-get update \
     && apt-get -y install --no-install-recommends gcc python-dev \
