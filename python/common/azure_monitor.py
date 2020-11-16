@@ -8,7 +8,7 @@ import platform
 from opencensus.ext.azure.log_exporter import AzureEventHandler
 from opencensus.ext.azure.log_exporter import AzureLogHandler
 
-ai_connection_string = os.environ["THIEF_AI_CONNECTION_STRING"]
+app_insights_connection_string = os.environ["THIEF_APP_INSIGHTS_CONNECTION_STRING"]
 
 _client_type = None
 _run_id = None
@@ -63,7 +63,7 @@ def get_event_logger():
     global _client_type, _run_id
     logger = logging.getLogger("thief_events.{}".format(_client_type))
 
-    handler = AzureEventHandler(connection_string=ai_connection_string)
+    handler = AzureEventHandler(connection_string=app_insights_connection_string)
     handler.add_telemetry_processor(telemetry_processor_callback)
 
     handler.setLevel(logging.INFO)
@@ -79,7 +79,7 @@ def log_to_azure_monitor(logger_name):
     global log_handler
 
     if not log_handler:
-        log_handler = AzureLogHandler(connection_string=ai_connection_string)
+        log_handler = AzureLogHandler(connection_string=app_insights_connection_string)
         log_handler.add_telemetry_processor(telemetry_processor_callback)
 
     logging.getLogger(logger_name).addHandler(log_handler)

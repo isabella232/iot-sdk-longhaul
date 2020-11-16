@@ -14,13 +14,13 @@ stats = stats_module.stats
 view_manager = stats.view_manager
 stats_recorder = stats.stats_recorder
 
-ai_connection_string = os.environ["THIEF_AI_CONNECTION_STRING"]
+app_insights_connection_string = os.environ["THIEF_APP_INSIGHTS_CONNECTION_STRING"]
 
 
 class MetricsReporter(object):
     def __init__(self):
         self.exporter = metrics_exporter.new_metrics_exporter(
-            connection_string=ai_connection_string
+            connection_string=app_insights_connection_string
         )
         self.exporter.add_telemetry_processor(azure_monitor.telemetry_processor_callback)
         view_manager.register_exporter(self.exporter)

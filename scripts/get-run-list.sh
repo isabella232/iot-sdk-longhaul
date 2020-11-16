@@ -12,12 +12,6 @@ az iot hub query \
             , properties.reported.thief.runTime \
             , properties.reported.thief.latestUpdateTimeUtc \
             , properties.reported.thief.languageVersion \
-            , properties.reported.thief.sendMessageCountSent \
-            , properties.reported.thief.sendMessageCountNotReceivedByService \
-            , properties.reported.thief.sendMessageCountUnacked \
-            , properties.reported.thief.sendMessageCountFailures \
-            , properties.reported.thief.receiveMessageCountReceived \
-            , properties.reported.thief.receiveMessageCountMissing \
         from devices \
         " \
     -o table

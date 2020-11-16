@@ -31,5 +31,15 @@ The best way to run the tests is with two bash windows, one for the device app a
 
 In one windows, run `python python/device/device.py` and in the other window, run `python python/service/service.py`.
 
-The device app and the service app  both have code to abort if they do not receive a heartbeat from the other app within 30 seconds.
+## default environment for local runs
 
+`scripts/fetch_secrets.sh` populates environment variables for running locally.  This includes a default device ID and service pool name:
+
+```
+(longhaul) bertk@bertk-hp:~/repos/longhaul/docs$ printenv | grep "THIEF"
+<< some variabled removed from this document >>
+THIEF_DEVICE_ID=bertk_test_device
+THIEF_SERVICE_POOL=bertk_desktop_pool
+THIEF_REQUESTED_SERVICE_POOL=bertk_desktop_pool
+(longhaul) bertk@bertk-hp:~/repos/longhaul/docs$
+```

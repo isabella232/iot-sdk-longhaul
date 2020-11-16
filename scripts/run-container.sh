@@ -72,7 +72,6 @@ echo "creating container using image ${IMAGE}"
 echo "with name ${CONTAINER_NAME}"
 echo env=${ENV}
 az container create \
-    --debug \
     --resource-group ${THIEF_RUNS_RESOURCE_GROUP} \
     --name ${CONTAINER_NAME} \
     --image ${THIEF_CONTAINER_REGISTRY_HOST}/${IMAGE} \
