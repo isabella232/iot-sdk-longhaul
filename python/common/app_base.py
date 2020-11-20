@@ -18,6 +18,7 @@ WAITING = "waiting"
 RUNNING = "running"
 FAILED = "failed"
 COMPLETE = "complete"
+INTERRUPTED = "interrupted"
 
 
 class WorkerThreadInfo(object):
@@ -36,6 +37,7 @@ class WorkerThreadInfo(object):
 class AppBase(object):
     def __init__(self):
         self.system_health_telemetry = SystemHealthTelemetry()
+        self.paused = False
 
     @abc.abstractmethod
     def disconnect(self):
@@ -43,6 +45,24 @@ class AppBase(object):
 
     def pre_shutdown(self):
         pass
+
+    def pause_all_threads(self):
+        """
+        Pause all threads.  Used to stop all background threads while debugging
+        """
+        self.paused = True
+
+    def unpause_all_threads(self):
+        """
+        Unpause all threads.  Used when debugging is finished.
+        """
+        self.paused = False
+
+    def is_paused(self):
+        """
+        return True if threads should be paused.
+        """
+        return self.paused
 
     def get_fixed_system_metrics(self, version):
         return {
@@ -75,58 +95,70 @@ class AppBase(object):
 
         loop_start_epochtime = time.time()
         while self.metrics.run_state == RUNNING:
-            # Check all of our threads for failure, unexpected condition, or watchdog timeout
-            for worker in threads_to_launch:
-                if worker.future.done():
-                    try:
-                        error = worker.future.exception(timeout=0)
-                    except Exception as e:
-                        error = e
-                    if not error:
-                        error = Exception("{} thread exited prematurely".format(worker.name))
+            if self.is_paused():
+                time.sleep(1)
+                continue
 
-                    logger.error(
-                        "Future {} is complete because of exception {}".format(worker.name, error),
-                        exc_info=error,
-                    )
-                    worker.future = None
-                    self.metrics.run_state = FAILED
-                    self.metrics.exit_reason = str(error)
+            try:
+                # Check all of our threads for failure, unexpected condition, or watchdog timeout
+                for worker in threads_to_launch:
+                    if worker.future.done():
+                        try:
+                            error = worker.future.exception(timeout=0)
+                        except Exception as e:
+                            error = e
+                        if not error:
+                            error = Exception("{} thread exited prematurely".format(worker.name))
 
-                elif not worker.future.running():
-                    error = Exception(
-                        "Unexpected: Future {} is not running and not done".format(worker.name)
-                    )
-                    logger.error(str(error), exc_info=error)
-                    worker.future = None
-                    self.metrics.run_state = FAILED
-                    self.metrics.exit_reason = str(error)
-
-                elif (
-                    time.time() - worker.watchdog_epochtime
-                    > self.config.watchdog_failure_interval_in_seconds
-                ):
-                    error = Exception(
-                        "Future {} has not responded for {} seconds.  Failing".format(
-                            worker.name, time.time() - worker.watchdog_epochtime
+                        logger.error(
+                            "Future {} is complete because of exception {}".format(
+                                worker.name, error
+                            ),
+                            exc_info=error,
                         )
-                    )
-                    worker.future = None
-                    self.metrics.run_state = FAILED
-                    self.metrics.exit_reason = str(error)
+                        worker.future = None
+                        self.metrics.run_state = FAILED
+                        self.metrics.exit_reason = str(error)
 
-            # If we're still running, check to see if we're done.  If not, sleep and loop again.
-            if self.metrics.run_state == RUNNING:
+                    elif not worker.future.running():
+                        error = Exception(
+                            "Unexpected: Future {} is not running and not done".format(worker.name)
+                        )
+                        logger.error(str(error), exc_info=error)
+                        worker.future = None
+                        self.metrics.run_state = FAILED
+                        self.metrics.exit_reason = str(error)
 
-                if self.config.max_run_duration and (
-                    time.time() - loop_start_epochtime > self.config.max_run_duration
-                ):
-                    self.metrics.run_state = COMPLETE
-                    self.metrics.exit_rason = "Run passed after {}".format(
-                        datetime.timedelta(self.config.max_run_duration)
-                    )
-                else:
-                    time.sleep(1)
+                    elif (
+                        time.time() - worker.watchdog_epochtime
+                        > self.config.watchdog_failure_interval_in_seconds
+                    ):
+                        error = Exception(
+                            "Future {} has not responded for {} seconds.  Failing".format(
+                                worker.name, time.time() - worker.watchdog_epochtime
+                            )
+                        )
+                        worker.future = None
+                        self.metrics.run_state = FAILED
+                        self.metrics.exit_reason = str(error)
+
+                # If we're still running, check to see if we're done.  If not, sleep and loop again.
+                if self.metrics.run_state == RUNNING:
+
+                    if self.config.max_run_duration and (
+                        time.time() - loop_start_epochtime > self.config.max_run_duration
+                    ):
+                        self.metrics.run_state = COMPLETE
+                        self.metrics.exit_rason = "Run passed after {}".format(
+                            datetime.timedelta(self.config.max_run_duration)
+                        )
+                    else:
+                        time.sleep(1)
+
+            except (KeyboardInterrupt, Exception) as e:
+                logger.error("Exception {} caught in main loop".format(e), exc_info=True)
+                self.metrics.run_state = INTERRUPTED if isinstance(e, KeyboardInterrupt) else FAILED
+                self.metrics.exit_reason = "Main thread raised {}".format(type(e))
 
         logger.info("Run is complete.  Cleaning up.")
         logger.info(

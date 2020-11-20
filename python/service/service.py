@@ -10,13 +10,12 @@ import json
 import datetime
 import app_base
 import uuid
-import string
-import random
 from concurrent.futures import ThreadPoolExecutor
 from azure.iot.hub import IoTHubRegistryManager
 import azure.iot.hub.constant
 from azure.eventhub import EventHubConsumerClient
 import azure_monitor
+from utilities import get_random_string
 
 
 logging.basicConfig(level=logging.WARNING)
@@ -52,11 +51,14 @@ azure_monitor.log_to_azure_monitor("azure")
 azure_monitor.log_to_azure_monitor("uamqp")
 
 
-def random_string(length):
-    """
-    return a random string
-    """
-    return "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(length))
+# TODO: move this to thief_constants.py along with RUNNING, etc.
+class PingbackType(object):
+    TELEMETRY_PINGBACK = "telemetry"
+    ADD_REPORTED_PROPERTY_PINGBACK = "add_reported"
+    REMOVE_REPORTED_PROPERTY_PINGBACK = "remove_reported"
+
+
+# TODO: remove items from pairing list of no traffic for X minutes
 
 
 class PerDeviceData(object):
@@ -72,6 +74,11 @@ class PerDeviceData(object):
         self.c2d_interval_in_seconds = 0
         self.c2d_filler_size = 0
         self.c2d_next_message_epochtime = 0
+
+        # for verifying reported property changes
+        self.reported_property_list_lock = threading.Lock()
+        self.reported_property_add_list = {}
+        self.reported_property_remove_list = {}
 
 
 class ServiceRunMetrics(object):
@@ -99,8 +106,8 @@ class ServiceRunConfig(object):
         # How long do we allow a thread to be unresponsive for.
         self.watchdog_failure_interval_in_seconds = 300
 
-        # How often to check device twins to make sure the device is still running
-        self.check_device_pairing_state_interval_in_seconds = 30
+        # How often to check device twins to make sure we're still paired and to look for reported property changes
+        self.check_device_twin_interval_in_seconds = 30
 
 
 def get_device_id_from_event(event):
@@ -154,11 +161,9 @@ class ServiceApp(app_base.AppBase):
         while not self.done.isSet():
             worker_thread_info.watchdog_epochtime = time.time()
 
-            # Step #1: see if we have any pairingRequest events waiting in the queue
+            # See if we have any pairingRequest events waiting in the queue
             try:
-                event = self.incoming_pairing_request_queue.get(
-                    timeout=self.config.check_device_pairing_state_interval_in_seconds
-                )
+                event = self.incoming_pairing_request_queue.get(timeout=5)
             except queue.Empty:
                 event = None
 
@@ -203,6 +208,7 @@ class ServiceApp(app_base.AppBase):
                     }
                 )
 
+                logger.info("Putting pairing request into outgoing c2d queue")
                 self.outgoing_c2d_queue.put(
                     (
                         device_id,
@@ -214,11 +220,17 @@ class ServiceApp(app_base.AppBase):
                 # at this point, the device might choose us or it might not, but we've
                 # tried.
 
-            # Step 2: Look at all devices we're paired with and make sure nothing happened to
-            # make us remove them from our list.
+    def check_device_twin_thread(self, worker_thread_info):
+
+        while not self.done.isSet():
+            worker_thread_info.watchdog_epochtime = time.time()
+            if self.is_paused():
+                time.sleep(1)
+                continue
 
             with self.pairing_list_lock:
                 list_copy = self.paired_devices.copy()
+
             for device_id in list_copy:
                 with self.registry_manager_lock:
                     twin = self.registry_manager.get_twin(device_id)
@@ -226,7 +238,6 @@ class ServiceApp(app_base.AppBase):
                 if twin.properties.reported["thief"]["runState"] != app_base.RUNNING:
                     logger.warning("device {} is not running.  Removing.".format(device_id))
                     self.unpair_device(device_id)
-
                 else:
                     logger.info(
                         "device {} is still paired and alive.  Continuing to monitor".format(
@@ -234,7 +245,61 @@ class ServiceApp(app_base.AppBase):
                         )
                     )
 
-                # TODO: remove items from list of no traffic for X minutes
+                    # check for added and removed properties
+                    per_device_info = list_copy[device_id]
+                    property_pingbacks = []
+
+                    with per_device_info.reported_property_list_lock:
+                        new_add_list = {}
+                        new_remove_list = {}
+                        property_test_list = twin.properties.reported["thief"].get(
+                            "propertyTest", {}
+                        )
+
+                        for key in per_device_info.reported_property_add_list:
+                            if key in property_test_list:
+                                property_pingbacks.append(
+                                    {"pingbackId": per_device_info.reported_property_add_list[key]}
+                                )
+                            else:
+                                new_add_list[key] = property_test_list[key]
+
+                        for key in per_device_info.reported_property_remove_list:
+                            if key not in property_test_list:
+                                property_pingbacks.append(
+                                    {
+                                        "pingbackId": per_device_info.reported_property_remove_list[
+                                            key
+                                        ]
+                                    }
+                                )
+                            else:
+                                new_add_list[key] = property_test_list[key]
+
+                        per_device_info.reported_property_add_list = new_add_list
+                        per_device_info.reported_property_remove_list = new_remove_list
+
+                    if property_pingbacks:
+                        message = json.dumps(
+                            {
+                                "thief": {
+                                    "cmd": "pingbackResponse",
+                                    "serviceRunAppId": run_id,
+                                    "pairingId": per_device_info.pairing_id,
+                                    "pingbacks": property_pingbacks,
+                                }
+                            }
+                        )
+
+                        self.outgoing_c2d_queue.put(
+                            (
+                                device_id,
+                                message,
+                                {"contentType": "application/json", "contentEncoding": "utf-8"},
+                            )
+                        )
+
+            time.sleep(self.config.check_device_twin_interval_in_seconds)
 
     def unpair_device(self, device_id):
         # TODO: this isn't very robust.  There should be some way to tell the device that we're done.
@@ -307,16 +372,46 @@ class ServiceApp(app_base.AppBase):
                     service_app_run_id=service_app_run_id,
                 )
 
-                if device_id in self.paired_devices:
+                with self.pairing_list_lock:
+                    per_device_info = self.paired_devices.get(device_id, None)
+
+                if per_device_info:
                     if cmd == "pingbackRequest":
-                        logger.info(
-                            "received pingback request from {} with pingbackId {}".format(
-                                device_id, event.body_as_json()["thief"]["pingbackId"]
+                        pingback_type = thief.get("pingbackType", PingbackType.TELEMETRY_PINGBACK)
+
+                        if pingback_type == PingbackType.TELEMETRY_PINGBACK:
+                            logger.info(
+                                "received telemtelemetry pingback request from {} with pingbackId {}".format(
+                                    device_id, thief["pingbackId"]
+                                )
                             )
-                        )
-                        self.incoming_pingback_request_queue.put(
-                            (event, partition_context.partition_id)
-                        )
+                            self.incoming_pingback_request_queue.put(
+                                (event, partition_context.partition_id)
+                            )
+                        elif pingback_type == PingbackType.ADD_REPORTED_PROPERTY_PINGBACK:
+                            logger.info(
+                                "Adding add property pingback check for {} from {} with pingbackId {}".format(
+                                    thief["propertyName"], device_id, thief["pingbackId"]
+                                )
+                            )
+                            with per_device_info.reported_property_list_lock:
+                                per_device_info.reported_property_add_list[
+                                    thief["propertyName"]
+                                ] = thief["pingbackId"]
+                        elif pingback_type == PingbackType.REMOVE_REPORTED_PROPERTY_PINGBACK:
+                            logger.info(
+                                "Adding remove property pingback check for {} from {} with pingbackId {}".format(
+                                    thief["propertyName"], device_id, thief["pingbackId"]
+                                )
+                            )
+                            with per_device_info.reported_property_list_lock:
+                                per_device_info.reported_property_remove_list[
+                                    thief["propertyName"]
+                                ] = thief["pingbackId"]
+                        else:
+                            logger.warning(
+                                "unknown pingback type: {}. Ignoring.".format(pingback_type)
+                            )
                     elif cmd == "startC2dMessageSending":
                         self.start_c2d_message_sending(device_id, thief)
                     else:
@@ -334,6 +429,10 @@ class ServiceApp(app_base.AppBase):
     def send_outgoing_c2d_messages_thread(self, worker_thread_info):
         while not (self.done.isSet() and self.outgoing_c2d_queue.empty()):
             worker_thread_info.watchdog_epochtime = time.time()
+            if self.is_paused():
+                time.sleep(1)
+                continue
+
             try:
                 (device_id, message, props) = self.outgoing_c2d_queue.get(timeout=1)
             except queue.Empty:
@@ -342,16 +441,27 @@ class ServiceApp(app_base.AppBase):
                 with self.pairing_list_lock:
                     do_send = device_id in self.paired_devices
 
-                if do_send:
-                    tries_left = 3
+                if not do_send:
+                    logger.warning(
+                        "c2d found in outgoing queue for device {} which is not paired".format(
+                            device_id
+                        )
+                    )
+                else:
+                    MAX_TRIES = 3
+                    tries_left = MAX_TRIES
                     success = False
+
                     while tries_left and not success:
-                        tries_left -= 1
                         try:
                             with self.registry_manager_lock:
                                 self.registry_manager.send_c2d_message(device_id, message, props)
                                 success = True
+                                if tries_left != MAX_TRIES:
+                                    # only log success if this is a retry
+                                    logger.info("message sent successfully")
                         except Exception as e:
+                            tries_left -= 1
                             if tries_left:
                                 logger.error(
                                     "send_c2d_messge raised {}.  Reconnecting and trying again.".format(
@@ -365,6 +475,7 @@ class ServiceApp(app_base.AppBase):
                                     self.registry_manager = IoTHubRegistryManager(
                                         iothub_connection_string
                                     )
+                                logger.info("new registry_manager object created")
                             else:
                                 logger.error(
                                     "send_c2d_messge to {} raised {}.  Final error. Forcing un-pair with device".format(
@@ -382,6 +493,10 @@ class ServiceApp(app_base.AppBase):
 
         while not self.done.isSet():
             worker_thread_info.watchdog_epochtime = time.time()
+            if self.is_paused():
+                time.sleep(1)
+                continue
+
             pingbacks = {}
             while True:
                 try:
@@ -456,6 +571,9 @@ class ServiceApp(app_base.AppBase):
         while not self.done.isSet():
             now = time.time()
             worker_thread_info.watchdog_epochtime = now
+            if self.is_paused():
+                time.sleep(1)
+                continue
 
             with self.pairing_list_lock:
                 devices = list(self.paired_devices.keys())
@@ -484,7 +602,7 @@ class ServiceApp(app_base.AppBase):
                                 "pairingId": device_data.pairing_id,
                                 "firstMessage": not device_data.first_c2d_sent,
                                 "testC2dMessageIndex": device_data.next_c2d_message_index,
-                                "filler": random_string(device_data.c2d_filler_size),
+                                "filler": get_random_string(device_data.c2d_filler_size),
                             }
                         }
                     )
@@ -542,6 +660,7 @@ class ServiceApp(app_base.AppBase):
             app_base.WorkerThreadInfo(
                 self.handle_pairing_request_thread, "handle_pairing_request_thread"
             ),
+            app_base.WorkerThreadInfo(self.check_device_twin_thread, " check_device_twin_thread"),
             app_base.WorkerThreadInfo(
                 self.send_outgoing_c2d_messages_thread, "send_outgoing_c2d_messages_thread"
             ),

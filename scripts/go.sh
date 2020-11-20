@@ -9,13 +9,14 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 LANGUAGE=py36
 DEVICE_VERSION=2.4.0
 SERVICE_VERSION=2.2.3
-TAG=nov16
+TAG=nov18
+POOL=${TAG}-pool
 
 ${script_dir}/build-image.sh --language ${LANGUAGE} --library service --version ${SERVICE_VERSION} --tag ${TAG}
 ${script_dir}/build-image.sh --language ${LANGUAGE} --library device --version ${DEVICE_VERSION} --tag ${TAG}
 
-${script_dir}/run-container.sh --language ${LANGUAGE} --library service --version ${SERVICE_VERSION} --tag ${TAG} --pool ${TAG}
-${script_dir}/run-container.sh --language ${LANGUAGE} --library device --version ${DEVICE_VERSION} --tag ${TAG} --pool ${TAG} --device_id ${TAG}-1
-${script_dir}/run-container.sh --language ${LANGUAGE} --library device --version ${DEVICE_VERSION} --tag ${TAG} --pool ${TAG} --device_id ${TAG}-2
-${script_dir}/run-container.sh --language ${LANGUAGE} --library device --version ${DEVICE_VERSION} --tag ${TAG} --pool ${TAG} --device_id ${TAG}-3
+${script_dir}/run-container.sh --language ${LANGUAGE} --library service --version ${SERVICE_VERSION} --tag ${TAG} --pool ${POOL}
+${script_dir}/run-container.sh --language ${LANGUAGE} --library device --version ${DEVICE_VERSION} --tag ${TAG} --pool ${POOL} --device_id ${POOL}-1
+${script_dir}/run-container.sh --language ${LANGUAGE} --library device --version ${DEVICE_VERSION} --tag ${TAG} --pool ${POOL} --device_id ${POOL}-2
+${script_dir}/run-container.sh --language ${LANGUAGE} --library device --version ${DEVICE_VERSION} --tag ${TAG} --pool ${POOL} --device_id ${POOL}-3
 
