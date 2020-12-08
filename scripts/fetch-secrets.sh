@@ -8,7 +8,9 @@ if [ "${BASH_SOURCE-}" = "$0" ]; then
     exit 33
 fi
 
-THIEF_KEYVAULT_NAME="thief-kv"
+if [ "${THIEF_KEYVAULT_NAME}" == "" ]; then
+    export THIEF_KEYVAULT_NAME="thief-kv"
+fi
 
 function get-secret {
     bash_name=$1

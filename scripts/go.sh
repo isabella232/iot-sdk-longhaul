@@ -9,8 +9,8 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 LANGUAGE=py36
 DEVICE_VERSION=2.4.0
 SERVICE_VERSION=2.2.3
-TAG=nov18
-POOL=${TAG}-pool
+TAG=dec7a
+POOL=${TAG}
 
 ${script_dir}/build-image.sh --language ${LANGUAGE} --library service --version ${SERVICE_VERSION} --tag ${TAG}
 ${script_dir}/build-image.sh --language ${LANGUAGE} --library device --version ${DEVICE_VERSION} --tag ${TAG}

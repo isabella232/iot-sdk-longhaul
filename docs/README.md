@@ -23,3 +23,7 @@ You do **not** need to configure your workstation if you want to:
 * [Looking at test status using a CLI tool](./cli-tools.md)
 * [Reading test logs and metrics using Azure Monitor](./azure-monitor-logs.md)
 
+## Implementation Details
+* [Environment variables](./environment-variables.md)
+* [Names and IDs](./names-and-ids.md)
+

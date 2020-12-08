@@ -13,6 +13,7 @@ source ${script_dir}/_get_base_env $1 $2
 pushd ${script_dir}/..
 az acr build \
     --registry ${THIEF_CONTAINER_REGISTRY_SHORTNAME} \
+    --subscription ${THIEF_SUBSCRIPTION_ID} \
     --platform=${PLATFORM} \
     -t ${THIEF_CONTAINER_REGISTRY_HOST}/${BASE_DOCKER_IMAGE_NAME} \
     ${BASE_DOCKER_BUILD_ARGS} \

@@ -5,13 +5,14 @@
 
 az iot hub query \
     -l "${THIEF_SERVICE_CONNECTION_STRING}"  \
+    --subscription $THIEF_SUBSCRIPTION_ID \
     -q "select \
             deviceId \
-            , properties.reported.thief.runState \
-            , properties.reported.thief.language \
-            , properties.reported.thief.runTime \
-            , properties.reported.thief.latestUpdateTimeUtc \
-            , properties.reported.thief.languageVersion \
+            , properties.reported.thief.sessionMetrics.runState \
+            , properties.reported.thief.systemProperties.language \
+            , properties.reported.thief.sessionMetrics.runTime \
+            , properties.reported.thief.sessionMetrics.latestUpdateTimeUtc \
+            , properties.reported.thief.systemProperties.languageVersion \
         from devices \
         " \
     -o table

@@ -61,10 +61,10 @@ fi
 
 case ${LIBRARY} in
     device) 
-        ENV="--environment-variables THIEF_DEVICE_ID=${DEVICE_ID} THIEF_REQUESTED_SERVICE_POOL=${SERVICE_POOL}"
+        ENV="--environment-variables THIEF_DEVICE_ID=${DEVICE_ID} THIEF_REQUESTED_SERVICE_POOL=${SERVICE_POOL} THIEF_KEYVAULT_NAME=${THIEF_KEYVAULT_NAME}"
         ;;
     service)
-        ENV="--environment-variables THIEF_SERVICE_POOL=${SERVICE_POOL}"
+        ENV="--environment-variables THIEF_SERVICE_POOL=${SERVICE_POOL} THIEF_KEYVAULT_NAME=${THIEF_KEYVAULT_NAME}"
         ;;
 esac
 
@@ -73,6 +73,7 @@ echo "with name ${CONTAINER_NAME}"
 echo env=${ENV}
 az container create \
     --resource-group ${THIEF_RUNS_RESOURCE_GROUP} \
+    --subscription ${THIEF_SUBSCRIPTION_ID} \
     --name ${CONTAINER_NAME} \
     --image ${THIEF_CONTAINER_REGISTRY_HOST}/${IMAGE} \
     ${ENV} \

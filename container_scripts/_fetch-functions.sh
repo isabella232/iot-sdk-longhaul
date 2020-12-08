@@ -1,8 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 # Licensed under the MIT license. See LICENSE file in the project root for
 # full license information.
-export THIEF_KEYVAULT_NAME="thief-kv"
-
 TOKEN_FAILURES_ALLOWED=10
 token_failures=0
 

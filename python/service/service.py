@@ -18,7 +18,7 @@ import azure_monitor
 from utilities import get_random_string
 
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s", level=logging.WARNING)
 logging.getLogger("thief").setLevel(level=logging.INFO)
 logging.getLogger("azure.iot").setLevel(level=logging.INFO)
 
@@ -28,9 +28,9 @@ logger = logging.getLogger("thief.{}".format(__name__))
 iothub_connection_string = os.environ["THIEF_SERVICE_CONNECTION_STRING"]
 eventhub_connection_string = os.environ["THIEF_EVENTHUB_CONNECTION_STRING"]
 eventhub_consumer_group = os.environ["THIEF_EVENTHUB_CONSUMER_GROUP"]
+service_pool = os.environ["THIEF_SERVICE_POOL"]
 
 # use os.getenv() for optional environment variables
-service_pool = os.getenv("THIEF_SERVICE_POOL")
 run_id = os.getenv("THIEF_SERVICE_APP_RUN_ID")
 
 if not run_id:
@@ -39,11 +39,12 @@ if not run_id:
 cs_info = dict(map(str.strip, sub.split("=", 1)) for sub in iothub_connection_string.split(";"))
 
 # configure our traces and events to go to Azure Monitor
-azure_monitor.configure_logging(
+azure_monitor.add_logging_properties(
     client_type="service",
     run_id=run_id,
     hub=cs_info["HostName"],
     sdk_version=azure.iot.hub.constant.VERSION,
+    pool_id=service_pool,
 )
 event_logger = azure_monitor.get_event_logger()
 azure_monitor.log_to_azure_monitor("thief")
@@ -61,13 +62,23 @@ class PingbackType(object):
 # TODO: remove items from pairing list of no traffic for X minutes
 
 
+def custom_props(device_id, pairing_id=None):
+    """
+    helper function for adding customDimensions to logger calls at execution time
+    """
+    props = {"deviceId": device_id}
+    if pairing_id:
+        props["pairingId"] = pairing_id
+    return {"custom_dimensions": props}
+
+
 class PerDeviceData(object):
     def __init__(self, pairing_id):
         # For Pairing
         self.pairing_id = pairing_id
         self.pairing_complete = False
 
-        # For C2D
+        # For testing C2D
         self.test_c2d_enabled = False
         self.first_c2d_sent = False
         self.next_c2d_message_index = 0
@@ -143,7 +154,10 @@ class ServiceApp(app_base.AppBase):
 
     def add_device_to_pairing_list(self, event):
         device_id = get_device_id_from_event(event)
-        logger.info("pairing request received for device {}. Queueing.".format(device_id))
+        logger.info(
+            "pairing request received for device {}. Queueing.".format(device_id),
+            extra=custom_props(device_id),
+        )
         self.incoming_pairing_request_queue.put(event)
 
     def handle_pairing_request_thread(self, worker_thread_info):
@@ -169,7 +183,6 @@ class ServiceApp(app_base.AppBase):
 
             if event:
                 device_id = get_device_id_from_event(event)
-                logger.info("attempting to pair with device {}".format(device_id))
 
                 body = event.body_as_json()
                 thief = body.get("thief", None)
@@ -180,6 +193,11 @@ class ServiceApp(app_base.AppBase):
                 if not pairing_id:
                     continue
 
+                logger.info(
+                    "attempting to pair with device {}".format(device_id),
+                    extra=custom_props(device_id, pairing_id),
+                )
+
                 # Maybe the device app wants an instance from a specific pool.  If we're not
                 # in that pool. we can stop
                 requested_service_pool = thief.get("requestedServicePool", None)
@@ -187,7 +205,8 @@ class ServiceApp(app_base.AppBase):
                     logger.info(
                         "device {} requesting an app in a diffeent pool: {}".format(
                             device_id, thief["requestedServicePool"]
-                        )
+                        ),
+                        extra=custom_props(device_id, pairing_id),
                     )
                     continue
 
@@ -195,8 +214,9 @@ class ServiceApp(app_base.AppBase):
                 # using our run_id, then we know that it chose us.
 
                 # add to paired_devices to the outgoing thread will send it.
+                device_data = PerDeviceData(pairing_id)
                 with self.pairing_list_lock:
-                    self.paired_devices[device_id] = PerDeviceData(pairing_id)
+                    self.paired_devices[device_id] = device_data
 
                 message = json.dumps(
                     {
@@ -208,7 +228,10 @@ class ServiceApp(app_base.AppBase):
                     }
                 )
 
-                logger.info("Putting pairing request into outgoing c2d queue")
+                logger.info(
+                    "Putting pairing request into outgoing c2d queue",
+                    extra=custom_props(device_id, pairing_id),
+                )
                 self.outgoing_c2d_queue.put(
                     (
                         device_id,
@@ -221,6 +244,9 @@ class ServiceApp(app_base.AppBase):
                 # tried.
 
     def check_device_twin_thread(self, worker_thread_info):
+        """
+        Thread which queries the device at a regular interval
+        """
 
         while not self.done.isSet():
             worker_thread_info.watchdog_epochtime = time.time()
@@ -232,52 +258,73 @@ class ServiceApp(app_base.AppBase):
                 list_copy = self.paired_devices.copy()
 
             for device_id in list_copy:
+                device_data = list_copy[device_id]
+                pairing_id = device_data.pairing_id
+
                 with self.registry_manager_lock:
                     twin = self.registry_manager.get_twin(device_id)
 
-                if twin.properties.reported["thief"]["runState"] != app_base.RUNNING:
-                    logger.warning("device {} is not running.  Removing.".format(device_id))
-                    self.unpair_device(device_id)
+                thief = twin.properties.reported.get("thief", None)
+                session_metrics = None
+                if thief:
+                    session_metrics = thief.get("sessionMetrics", None)
+                if not session_metrics:
+                    logger.info(
+                        "session metrics for {} is empty.  ignoring twin.".format(device_id),
+                        extra=custom_props(device_id, pairing_id),
+                    )
+                elif session_metrics["runState"] != app_base.RUNNING:
+                    if session_metrics["pairingId"] != pairing_id:
+                        logger.warning(
+                            "device {} has sessionMetrics tagged an old session id {}:  Ignoring twin.".format(
+                                device_id, session_metrics["pairingId"]
+                            ),
+                            extra=custom_props(device_id, pairing_id),
+                        )
+                    else:
+                        logger.warning(
+                            "device {} is not running.  Removing.".format(device_id),
+                            extra=custom_props(device_id, pairing_id),
+                        )
+                        self.unpair_device(device_id)
                 else:
                     logger.info(
                         "device {} is still paired and alive.  Continuing to monitor".format(
                             device_id
-                        )
+                        ),
+                        extra=custom_props(device_id, pairing_id),
                     )
 
                     # check for added and removed properties
-                    per_device_info = list_copy[device_id]
                     property_pingbacks = []
 
-                    with per_device_info.reported_property_list_lock:
+                    with device_data.reported_property_list_lock:
                         new_add_list = {}
                         new_remove_list = {}
                         property_test_list = twin.properties.reported["thief"].get(
                             "propertyTest", {}
                         )
 
-                        for key in per_device_info.reported_property_add_list:
+                        for key in device_data.reported_property_add_list:
                             if key in property_test_list:
                                 property_pingbacks.append(
-                                    {"pingbackId": per_device_info.reported_property_add_list[key]}
+                                    {"pingbackId": device_data.reported_property_add_list[key]}
                                 )
                             else:
-                                new_add_list[key] = property_test_list[key]
+                                new_add_list[key] = device_data.reported_property_add_list[key]
 
-                        for key in per_device_info.reported_property_remove_list:
+                        for key in device_data.reported_property_remove_list:
                             if key not in property_test_list:
                                 property_pingbacks.append(
-                                    {
-                                        "pingbackId": per_device_info.reported_property_remove_list[
-                                            key
-                                        ]
-                                    }
+                                    {"pingbackId": device_data.reported_property_remove_list[key]}
                                 )
                             else:
-                                new_add_list[key] = property_test_list[key]
+                                new_remove_list[key] = device_data.reported_property_remove_list[
+                                    key
+                                ]
 
-                        per_device_info.reported_property_add_list = new_add_list
-                        per_device_info.reported_property_remove_list = new_remove_list
+                        device_data.reported_property_add_list = new_add_list
+                        device_data.reported_property_remove_list = new_remove_list
 
                     if property_pingbacks:
                         message = json.dumps(
@@ -285,7 +332,7 @@ class ServiceApp(app_base.AppBase):
                                 "thief": {
                                     "cmd": "pingbackResponse",
                                     "serviceRunAppId": run_id,
-                                    "pairingId": per_device_info.pairing_id,
+                                    "pairingId": pairing_id,
                                     "pingbacks": property_pingbacks,
                                 }
                             }
@@ -305,10 +352,18 @@ class ServiceApp(app_base.AppBase):
         # TODO: this isn't very robust.  There should be some way to tell the device that we're done.
         with self.pairing_list_lock:
             if device_id in self.paired_devices:
-                logger.info("Unpairing {}. Removing it from paired device list".format(device_id))
+                pairing_id = self.paired_devices[device_id].pairing_id
+                logger.info(
+                    "Unpairing {}. Removing it from paired device list".format(device_id),
+                    extra=custom_props(device_id, pairing_id),
+                )
                 del self.paired_devices[device_id]
 
     def implicitely_update_paired_device_list(self, device_id, pairing_id, service_app_run_id):
+        """
+        update the pairing status of a device based on pairing_id and service_app_run_id,
+        probably received via telemetry message
+        """
 
         with self.pairing_list_lock:
             # See if this is coming from a device_id that we're interested in.  Do this
@@ -319,13 +374,17 @@ class ServiceApp(app_base.AppBase):
                     and service_app_run_id == run_id
                 ):
                     if not self.paired_devices[device_id].pairing_complete:
-                        logger.info("Device {} has decided to pair with us".format(device_id))
+                        logger.info(
+                            "Device {} has decided to pair with us".format(device_id),
+                            extra=custom_props(device_id, pairing_id),
+                        )
                         self.paired_devices[device_id].pairing_complete = True
                 else:
                     logger.info(
                         "Device {} has decided to pair with a different service instance:  {}".format(
                             device_id, service_app_run_id
-                        )
+                        ),
+                        extra=custom_props(device_id, pairing_id),
                     )
                     del self.paired_devices[device_id]
 
@@ -360,12 +419,15 @@ class ServiceApp(app_base.AppBase):
             device_id = get_device_id_from_event(event)
 
             if cmd == "pairingRequest":
-                logger.info("Got pairingRequest command for device {}".format(device_id))
+                logger.info(
+                    "Got pairingRequest command for device {}".format(device_id),
+                    extra=custom_props(device_id, pairing_id),
+                )
                 # If we're re-connecting a device, wipe out data from the previous relationship
                 self.unpair_device(device_id)
                 self.add_device_to_pairing_list(event)
 
-            else:
+            elif pairing_id and service_app_run_id:
                 self.implicitely_update_paired_device_list(
                     device_id=device_id,
                     pairing_id=pairing_id,
@@ -373,17 +435,18 @@ class ServiceApp(app_base.AppBase):
                 )
 
                 with self.pairing_list_lock:
-                    per_device_info = self.paired_devices.get(device_id, None)
+                    device_data = self.paired_devices.get(device_id, None)
 
-                if per_device_info:
+                if device_data:
                     if cmd == "pingbackRequest":
                         pingback_type = thief.get("pingbackType", PingbackType.TELEMETRY_PINGBACK)
 
                         if pingback_type == PingbackType.TELEMETRY_PINGBACK:
                             logger.info(
-                                "received telemtelemetry pingback request from {} with pingbackId {}".format(
+                                "received telemetry pingback request from {} with pingbackId {}".format(
                                     device_id, thief["pingbackId"]
-                                )
+                                ),
+                                extra=custom_props(device_id, pairing_id),
                             )
                             self.incoming_pingback_request_queue.put(
                                 (event, partition_context.partition_id)
@@ -392,30 +455,36 @@ class ServiceApp(app_base.AppBase):
                             logger.info(
                                 "Adding add property pingback check for {} from {} with pingbackId {}".format(
                                     thief["propertyName"], device_id, thief["pingbackId"]
-                                )
+                                ),
+                                extra=custom_props(device_id, pairing_id),
                             )
-                            with per_device_info.reported_property_list_lock:
-                                per_device_info.reported_property_add_list[
+                            with device_data.reported_property_list_lock:
+                                device_data.reported_property_add_list[
                                     thief["propertyName"]
                                 ] = thief["pingbackId"]
                         elif pingback_type == PingbackType.REMOVE_REPORTED_PROPERTY_PINGBACK:
                             logger.info(
                                 "Adding remove property pingback check for {} from {} with pingbackId {}".format(
                                     thief["propertyName"], device_id, thief["pingbackId"]
-                                )
+                                ),
+                                extra=custom_props(device_id, pairing_id),
                             )
-                            with per_device_info.reported_property_list_lock:
-                                per_device_info.reported_property_remove_list[
+                            with device_data.reported_property_list_lock:
+                                device_data.reported_property_remove_list[
                                     thief["propertyName"]
                                 ] = thief["pingbackId"]
                         else:
                             logger.warning(
-                                "unknown pingback type: {}. Ignoring.".format(pingback_type)
+                                "unknown pingback type: {}. Ignoring.".format(pingback_type),
+                                extra=custom_props(device_id, pairing_id),
                             )
                     elif cmd == "startC2dMessageSending":
                         self.start_c2d_message_sending(device_id, thief)
                     else:
-                        logger.info("Unknown command received from {}: {}".format(device_id, body))
+                        logger.info(
+                            "Unknown command received from {}: {}".format(device_id, body),
+                            extra=custom_props(device_id, pairing_id),
+                        )
 
         logger.info("starting receive")
         with self.eventhub_consumer_client:
@@ -455,7 +524,15 @@ class ServiceApp(app_base.AppBase):
                     while tries_left and not success:
                         try:
                             with self.registry_manager_lock:
+                                start = time.time()
                                 self.registry_manager.send_c2d_message(device_id, message, props)
+                                end = time.time()
+                                if end - start > 2:
+                                    logger.warning(
+                                        "Send throtttled.  Time delta={} seconds".format(
+                                            end - start
+                                        )
+                                    )
                                 success = True
                                 if tries_left != MAX_TRIES:
                                     # only log success if this is a retry
@@ -514,38 +591,45 @@ class ServiceApp(app_base.AppBase):
 
             if len(pingbacks):
                 for device_id in pingbacks:
-                    logger.info(
-                        "send pingback for device_id = {}: {}".format(
-                            device_id, pingbacks[device_id]
-                        )
-                    )
 
                     with self.pairing_list_lock:
                         if device_id in self.paired_devices:
-                            pairing_id = self.paired_devices[device_id].pairing_id
+                            device_data = self.paired_devices[device_id]
                         else:
-                            pairing_id = None
+                            device_data = None
 
-                    message = json.dumps(
-                        {
-                            "thief": {
-                                "cmd": "pingbackResponse",
-                                "serviceRunAppId": run_id,
-                                "pairingId": pairing_id,
-                                "pingbacks": pingbacks[device_id],
-                            }
-                        }
-                    )
+                    if device_data:
+                        pairing_id = device_data.pairing_id
 
-                    self.outgoing_c2d_queue.put(
-                        (
-                            device_id,
-                            message,
-                            {"contentType": "application/json", "contentEncoding": "utf-8"},
+                        logger.info(
+                            "send pingback for device_id = {}: {}".format(
+                                device_id, pingbacks[device_id]
+                            ),
+                            extra=custom_props(device_id, pairing_id),
                         )
-                    )
 
-            time.sleep(3)
+                        message = json.dumps(
+                            {
+                                "thief": {
+                                    "cmd": "pingbackResponse",
+                                    "serviceRunAppId": run_id,
+                                    "pairingId": pairing_id,
+                                    "pingbacks": pingbacks[device_id],
+                                }
+                            }
+                        )
+
+                        self.outgoing_c2d_queue.put(
+                            (
+                                device_id,
+                                message,
+                                {"contentType": "application/json", "contentEncoding": "utf-8"},
+                            )
+                        )
+
+            # TODO: this should be configurable
+            # Too small and this causes C2D throttling
+            time.sleep(15)
 
     def start_c2d_message_sending(self, device_id, thief):
         """
@@ -610,7 +694,8 @@ class ServiceApp(app_base.AppBase):
                     logger.info(
                         "Sending test c2d to {} with index {}".format(
                             device_id, device_data.next_c2d_message_index
-                        )
+                        ),
+                        extra=custom_props(device_id, device_data.pairing_id),
                     )
 
                     device_data.next_c2d_message_index += 1
@@ -671,6 +756,9 @@ class ServiceApp(app_base.AppBase):
         ]
 
         self.run_threads(threads_to_launch)
+
+        # 60 seconds to let app insights data flush
+        time.sleep(60)
 
     def pre_shutdown(self):
         # close the eventhub consumer before shutting down threads.  This is necessary because

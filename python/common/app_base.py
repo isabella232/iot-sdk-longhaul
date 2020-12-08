@@ -9,6 +9,7 @@ import datetime
 import sys
 import platform
 import os
+import traceback
 from system_health_telemetry import SystemHealthTelemetry
 
 
@@ -64,7 +65,7 @@ class AppBase(object):
         """
         return self.paused
 
-    def get_fixed_system_metrics(self, version):
+    def get_system_properties(self, version):
         return {
             "language": "python",
             "languageVersion": platform.python_version(),
@@ -85,6 +86,15 @@ class AppBase(object):
             "processWorkingSetPrivate": self.system_health_telemetry.process_working_set_private,
         }
         return props
+
+    def _dump_all_threads(self):
+        """
+        Dump all threads for debugging
+        """
+        if six.PY3:
+            for thread_id, frame in sys._current_frames().items():
+                logger.warning("Stack for thread {}".format(thread_id))
+                logger.warning(str(traceback.format_stack(frame)))
 
     def run_threads(self, threads_to_launch):
         # Launch the threads.
@@ -133,11 +143,12 @@ class AppBase(object):
                         time.time() - worker.watchdog_epochtime
                         > self.config.watchdog_failure_interval_in_seconds
                     ):
-                        error = Exception(
-                            "Future {} has not responded for {} seconds.  Failing".format(
-                                worker.name, time.time() - worker.watchdog_epochtime
-                            )
+                        reason = "Future {} has not responded for {} seconds.  Failing".format(
+                            worker.name, time.time() - worker.watchdog_epochtime
                         )
+                        error = Exception(reason)
+                        logger.error(reason)
+                        self._dump_all_threads()
                         worker.future = None
                         self.metrics.run_state = FAILED
                         self.metrics.exit_reason = str(error)

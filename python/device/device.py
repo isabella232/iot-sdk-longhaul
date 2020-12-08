@@ -36,24 +36,27 @@ logger = logging.getLogger("thief.{}".format(__name__))
 # TODO: add code to update desired properties when unpairing device.
 # TODO: add mid to debug logs as custom property, maybe pingback id
 # TODO: device send exit message to service
-# TODO: add pool name, pool id, and pairing ID to logs on both sides, also to reported properties
 
 # use os.environ[] for required environment variables
 provisioning_host = os.environ["THIEF_DEVICE_PROVISIONING_HOST"]
 id_scope = os.environ["THIEF_DEVICE_ID_SCOPE"]
 group_symmetric_key = os.environ["THIEF_DEVICE_GROUP_SYMMETRIC_KEY"]
 registration_id = os.environ["THIEF_DEVICE_ID"]
+requested_service_pool = os.environ["THIEF_REQUESTED_SERVICE_POOL"]
 
 # use os.getenv() for optional environment variables
 run_id = os.getenv("THIEF_DEVICE_APP_RUN_ID")
-requested_service_pool = os.getenv("THIEF_REQUESTED_SERVICE_POOL")
 
 if not run_id:
     run_id = str(uuid.uuid4())
 
 # configure our traces and events to go to Azure Monitor
-azure_monitor.configure_logging(
-    client_type="device", run_id=run_id, sdk_version=azure.iot.device.constant.VERSION,
+azure_monitor.add_logging_properties(
+    client_type="device",
+    run_id=run_id,
+    sdk_version=azure.iot.device.constant.VERSION,
+    transport="mqtt",
+    pool_id=requested_service_pool,
 )
 event_logger = azure_monitor.get_event_logger()
 azure_monitor.log_to_azure_monitor("thief")
@@ -148,7 +151,8 @@ class DeviceRunConfig(object):
         self.send_message_exception_allowed_failure_count = 10
 
         # How often do we want the service to send test C2D messages?
-        self.receive_message_interval_in_seconds = 2
+        # Be careful with this.  Too often will result in throttling on the service, which has 1.83  messages/sec/unit as a shared limit for all devices
+        self.receive_message_interval_in_seconds = 20
 
         # How big, in bytes, do we we want the random text size in test C2D messages to be
         self.receive_message_filler_size = 16 * 1024
@@ -163,7 +167,7 @@ class DeviceRunConfig(object):
         self.reported_properties_update_allowed_failure_count = 100
 
         # Max size of reported property values, in count of characters
-        self.reported_properties_update_property_max_size = 1024
+        self.reported_properties_update_property_max_size = 16
 
         # How many seconds do we wait for the service to acknowledge a reported property update
         # before we consider it failed
@@ -308,14 +312,12 @@ class DeviceApp(app_base.AppBase):
             "patches with remove operations(s)",
         )
 
-    def get_longhaul_metrics(self):
+    def get_session_metrics(self):
+        """
+        Return metrics which describe the session the tests are running in
+        """
         self.metrics.run_time = (
             datetime.datetime.now(datetime.timezone.utc) - self.metrics.run_start_utc
-        )
-
-        sent = self.metrics.send_message_count_sent.get_count()
-        received_by_service_app = (
-            self.metrics.send_message_count_received_by_service_app.get_count()
         )
 
         props = {
@@ -325,6 +327,20 @@ class DeviceApp(app_base.AppBase):
             "runTime": str(self.metrics.run_time),
             "runState": str(self.metrics.run_state),
             "exitReason": self.metrics.exit_reason,
+            "pairingId": self.pairing_id,
+        }
+        return props
+
+    def get_test_metrics(self):
+        """
+        Return metrics which describe the progress of the  different features being tested
+        """
+        sent = self.metrics.send_message_count_sent.get_count()
+        received_by_service_app = (
+            self.metrics.send_message_count_received_by_service_app.get_count()
+        )
+
+        props = {
             "sendMessageCountSent": sent,
             "sendMessageCountReceivedByServiceApp": received_by_service_app,
             "sendMessageCountFailures": self.metrics.send_message_count_failures.get_count(),
@@ -346,34 +362,39 @@ class DeviceApp(app_base.AppBase):
         properties
         """
         return {
-            "configThiefPropertyUpdateIntervalInSeconds": self.config.thief_property_update_interval_in_seconds,
-            "configWatchdogFailureIntervalInSeconds": self.config.watchdog_failure_interval_in_seconds,
-            "configPairingRequestTimeoutIntervalInSeconds": self.config.pairing_request_timeout_interval_in_seconds,
-            "configPairingRequestSendIntervalInSeconds": self.config.pairing_request_send_interval_in_seconds,
-            "configSendMessageOperationsPerSecond": self.config.send_message_operations_per_second,
-            "configSendMessageThreadCount": self.config.send_test_message_thread_count,
-            "configSendMessageArrivalFailureIntervalInSeconds": self.config.send_message_arrival_failure_interval_in_seconds,
-            "configSendMessageArrivalAllowedFailureCount": self.config.send_message_arrival_allowed_failure_count,
-            "configSendMessageBacklogAllowedFailureCount": self.config.send_message_backlog_allowed_failure_count,
-            "configSendMessageUnackedAllowedFailureCount": self.config.send_message_unacked_allowed_failure_count,
-            "configSendMessageExceptionAllowedFailureCount": self.config.send_message_exception_allowed_failure_count,
-            "configReceiveMessageIntervalInSeconds": self.config.receive_message_interval_in_seconds,
-            "configReceiveMessageFillerSize": self.config.receive_message_filler_size,
-            "configReceiveMessageMissingMessageAllowedFailureCount": self.config.receive_message_missing_message_allowed_failure_count,
-            "configReportedPropertiesUpdateIntervalInSeconds": self.config.reported_properties_update_interval_in_seconds,
-            "configReportedPropertiesUpdatePropertyMaxSize": self.config.reported_properties_update_property_max_size,
-            "configReportedPropertiesVerifyFailureIntervalInSeconds": self.config.reported_properties_verify_failure_interval_in_seconds,
-            "configReportedPropertiesUpdateAllowedFailureCount": self.config.reported_properties_update_allowed_failure_count,
+            "thiefPropertyUpdateIntervalInSeconds": self.config.thief_property_update_interval_in_seconds,
+            "watchdogFailureIntervalInSeconds": self.config.watchdog_failure_interval_in_seconds,
+            "pairingRequestTimeoutIntervalInSeconds": self.config.pairing_request_timeout_interval_in_seconds,
+            "pairingRequestSendIntervalInSeconds": self.config.pairing_request_send_interval_in_seconds,
+            "sendMessageOperationsPerSecond": self.config.send_message_operations_per_second,
+            "sendMessageThreadCount": self.config.send_test_message_thread_count,
+            "sendMessageArrivalFailureIntervalInSeconds": self.config.send_message_arrival_failure_interval_in_seconds,
+            "sendMessageArrivalAllowedFailureCount": self.config.send_message_arrival_allowed_failure_count,
+            "sendMessageBacklogAllowedFailureCount": self.config.send_message_backlog_allowed_failure_count,
+            "sendMessageUnackedAllowedFailureCount": self.config.send_message_unacked_allowed_failure_count,
+            "sendMessageExceptionAllowedFailureCount": self.config.send_message_exception_allowed_failure_count,
+            "receiveMessageIntervalInSeconds": self.config.receive_message_interval_in_seconds,
+            "receiveMessageFillerSize": self.config.receive_message_filler_size,
+            "receiveMessageMissingMessageAllowedFailureCount": self.config.receive_message_missing_message_allowed_failure_count,
+            "reportedPropertiesUpdateIntervalInSeconds": self.config.reported_properties_update_interval_in_seconds,
+            "reportedPropertiesUpdatePropertyMaxSize": self.config.reported_properties_update_property_max_size,
+            "reportedPropertiesVerifyFailureIntervalInSeconds": self.config.reported_properties_verify_failure_interval_in_seconds,
+            "reportedPropertiesUpdateAllowedFailureCount": self.config.reported_properties_update_allowed_failure_count,
         }
 
     def update_initial_reported_properties(self):
         """
         Update reported properties at the start of a run
         """
-        props = {"thief": self.get_longhaul_metrics()}
-        props["thief"].update(self.get_fixed_system_metrics(azure.iot.device.constant.VERSION))
-        props["thief"].update(self.get_longhaul_config_properties())
-        props["thief"]["propertyTest"] = None
+        props = {
+            "thief": {
+                "systemProperties": self.get_system_properties(azure.iot.device.constant.VERSION),
+                "sessionMetrics": self.get_session_metrics(),
+                "testMetrics": self.get_test_metrics(),
+                "config": self.get_longhaul_config_properties(),
+                "propertyTest": None,
+            }
+        }
         self.client.patch_twin_reported_properties(props)
 
     def create_message_from_dict(self, props):
@@ -470,12 +491,13 @@ class DeviceApp(app_base.AppBase):
             # Not a great design, but it lets us group this functionality into a single thread
             # without adding another signalling mechanism.
             if msg == "START_PAIRING":
-                logger.info("Starting pairing operation")
                 currently_pairing = True
                 pairing_start_epochtime = time.time()
                 pairing_last_request_epochtime = 0
                 self.pairing_id = str(uuid.uuid4())
                 self.service_run_app_id = None
+                azure_monitor.add_logging_properties(pairing_id=self.pairing_id)
+                logger.info("Starting pairing operation")
                 # set msg to None to trigger the block that sends the first pairingRequest message
                 msg = None
 
@@ -572,24 +594,31 @@ class DeviceApp(app_base.AppBase):
                     self.metrics.send_message_count_unacked.decrement()
 
     def send_metrics_to_azure_monitor(self, props):
-        self.reporter.set_process_cpu_percent(props["processCpuPercent"])
-        self.reporter.set_process_working_set(props["processWorkingSet"])
-        self.reporter.set_process_bytes_in_all_heaps(props["processBytesInAllHeaps"])
-        self.reporter.set_process_private_bytes(props["processPrivateBytes"])
-        self.reporter.set_process_working_set_private(props["processCpuPercent"])
+        # we don't record session_metrics to azure monitor
 
-        self.reporter.set_send_message_count_sent(props["sendMessageCountSent"])
+        system_health_metrics = props["systemHealthMetrics"]
+        self.reporter.set_process_cpu_percent(system_health_metrics["processCpuPercent"])
+        self.reporter.set_process_working_set(system_health_metrics["processWorkingSet"])
+        self.reporter.set_process_bytes_in_all_heaps(
+            system_health_metrics["processBytesInAllHeaps"]
+        )
+        self.reporter.set_process_private_bytes(system_health_metrics["processPrivateBytes"])
+        self.reporter.set_process_working_set_private(system_health_metrics["processCpuPercent"])
+
+        test_metrics = props["testMetrics"]
+        self.reporter.set_send_message_count_sent(test_metrics["sendMessageCountSent"])
         self.reporter.set_send_message_count_received_by_service_app(
-            props["sendMessageCountReceivedByServiceApp"]
+            test_metrics["sendMessageCountReceivedByServiceApp"]
         )
-        self.reporter.set_send_message_count_in_backlog(props["sendMessageCountInBacklog"])
-        self.reporter.set_send_message_count_unacked(props["sendMessageCountUnacked"])
+        self.reporter.set_send_message_count_in_backlog(test_metrics["sendMessageCountInBacklog"])
+        self.reporter.set_send_message_count_unacked(test_metrics["sendMessageCountUnacked"])
         self.reporter.set_send_message_count_not_received_by_service_app(
-            props["sendMessageCountNotReceivedByServiceApp"]
+            test_metrics["sendMessageCountNotReceivedByServiceApp"]
         )
-
-        self.reporter.set_receive_message_count_received(props["receiveMessageCountReceived"])
-        self.reporter.set_receive_message_count_missing(props["receiveMessageCountMissing"])
+        self.reporter.set_receive_message_count_received(
+            test_metrics["receiveMessageCountReceived"]
+        )
+        self.reporter.set_receive_message_count_missing(test_metrics["receiveMessageCountMissing"])
         self.reporter.record()
 
     def test_send_message_thread(self, worker_thread_info):
@@ -608,12 +637,13 @@ class DeviceApp(app_base.AppBase):
 
             if self.is_pairing_complete():
 
-                system_health = self.get_system_health_telemetry()
-                longhaul_metrics = self.get_longhaul_metrics()
-
-                props = {"thief": {}}
-                props["thief"].update(longhaul_metrics)
-                props["thief"].update(system_health)
+                props = {
+                    "thief": {
+                        "sessionMetrics": self.get_session_metrics(),
+                        "testMetrics": self.get_test_metrics(),
+                        "systemHealthMetrics": self.get_system_health_telemetry(),
+                    }
+                }
 
                 # push these same metrics to Azure Monitor
                 self.send_metrics_to_azure_monitor(props["thief"])
@@ -656,7 +686,13 @@ class DeviceApp(app_base.AppBase):
             if self.done.isSet():
                 done = True
 
-            props = {"thief": self.get_longhaul_metrics()}
+            props = {
+                "thief": {
+                    "sessionMetrics": self.get_session_metrics(),
+                    "testMetrics": self.get_test_metrics(),
+                    # system_health_metrics don't go into reported properties
+                }
+            }
 
             logger.info("updating thief props: {}".format(pprint.pformat(props)))
             self.client.patch_twin_reported_properties(props)
@@ -1048,7 +1084,7 @@ class DeviceApp(app_base.AppBase):
             id_scope=id_scope,
             group_symmetric_key=group_symmetric_key,
         )
-        azure_monitor.configure_logging(hub=self.hub, device_id=self.device_id)
+        azure_monitor.add_logging_properties(hub=self.hub, device_id=self.device_id)
         self.update_initial_reported_properties()
 
         # pair with a service app instance
@@ -1091,6 +1127,9 @@ class DeviceApp(app_base.AppBase):
         self.run_threads(worker_thread_infos)
 
         logger.info("Exiting main at {}".format(datetime.datetime.utcnow()))
+
+        # 60 seconds to let app insights data flush
+        time.sleep(60)
 
     def disconnect(self):
         self.client.disconnect()

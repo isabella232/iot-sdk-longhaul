@@ -41,6 +41,7 @@ fi
 pushd ${script_dir}/..
 az acr build \
     --registry ${THIEF_CONTAINER_REGISTRY_SHORTNAME} \
+    --subscription ${THIEF_SUBSCRIPTION_ID} \
     --platform=${PLATFORM} \
     ${TAGS} \
     --build-arg BASE="${THIEF_CONTAINER_REGISTRY_HOST}/${BASE_DOCKER_IMAGE_NAME}"  \

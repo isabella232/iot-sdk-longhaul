@@ -5,4 +5,5 @@
 
 az container logs \
     --resource-group ${THIEF_RUNS_RESOURCE_GROUP}  \
+    --subscription ${THIEF_SUBSCRIPTION_ID} \
     -n $1

@@ -12,6 +12,7 @@ fi
 
 az iot hub query \
     -l "${THIEF_SERVICE_CONNECTION_STRING}"  \
+    --subscription ${THIEF_SUBSCRIPTION_ID} \
     -q "select \
             deviceId \
             , properties.reported.thief \
