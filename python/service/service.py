@@ -120,6 +120,9 @@ class ServiceRunConfig(object):
         # How often to check device twins to make sure we're still paired and to look for reported property changes
         self.check_device_twin_interval_in_seconds = 30
 
+        # How often to refresh the AMQP connection.  Necessary because of a 10 minute hardcoded credential interval
+        self.amqp_refresh_interval_in_seconds = 9 * 60
+
 
 def get_device_id_from_event(event):
     return event.message.annotations["iothub-connection-device-id".encode()].decode()
@@ -496,11 +499,27 @@ class ServiceApp(app_base.AppBase):
             )
 
     def send_outgoing_c2d_messages_thread(self, worker_thread_info):
+        last_amqp_refresh_epochtime = time.time()
+
         while not (self.done.isSet() and self.outgoing_c2d_queue.empty()):
             worker_thread_info.watchdog_epochtime = time.time()
             if self.is_paused():
                 time.sleep(1)
                 continue
+
+            if (
+                time.time() - last_amqp_refresh_epochtime
+                > self.config.amqp_refresh_interval_in_seconds
+            ):
+                logger.warning(
+                    "AMPQ credential approaching expiration.  Recreating registry manager"
+                )
+                with self.registry_manager_lock:
+                    del self.registry_manager
+                    time.sleep(1)
+                    self.registry_manager = IoTHubRegistryManager(iothub_connection_string)
+                logger.info("New registry_manager object created")
+                last_amqp_refresh_epochtime = time.time()
 
             try:
                 (device_id, message, props) = self.outgoing_c2d_queue.get(timeout=1)
@@ -517,50 +536,24 @@ class ServiceApp(app_base.AppBase):
                         )
                     )
                 else:
-                    MAX_TRIES = 3
-                    tries_left = MAX_TRIES
-                    success = False
-
-                    while tries_left and not success:
-                        try:
-                            with self.registry_manager_lock:
-                                start = time.time()
-                                self.registry_manager.send_c2d_message(device_id, message, props)
-                                end = time.time()
-                                if end - start > 2:
-                                    logger.warning(
-                                        "Send throtttled.  Time delta={} seconds".format(
-                                            end - start
-                                        )
-                                    )
-                                success = True
-                                if tries_left != MAX_TRIES:
-                                    # only log success if this is a retry
-                                    logger.info("message sent successfully")
-                        except Exception as e:
-                            tries_left -= 1
-                            if tries_left:
-                                logger.error(
-                                    "send_c2d_messge raised {}.  Reconnecting and trying again.".format(
-                                        e
-                                    ),
-                                    exc_info=e,
-                                )
-                                with self.registry_manager_lock:
-                                    del self.registry_manager
-                                    time.sleep(1)
-                                    self.registry_manager = IoTHubRegistryManager(
-                                        iothub_connection_string
-                                    )
-                                logger.info("new registry_manager object created")
-                            else:
-                                logger.error(
-                                    "send_c2d_messge to {} raised {}.  Final error. Forcing un-pair with device".format(
-                                        device_id, str(e)
-                                    ),
-                                    exc_info=e,
-                                )
-                                self.unpair_device(device_id)
+                    start = time.time()
+                    try:
+                        with self.registry_manager_lock:
+                            self.registry_manager.send_c2d_message(device_id, message, props)
+                    except Exception as e:
+                        logger.error(
+                            "send_c2d_messge to {} raised {}.  Final error. Forcing un-pair with device".format(
+                                device_id, str(e)
+                            ),
+                            exc_info=e,
+                        )
+                        self.unpair_device(device_id)
+                    else:
+                        end = time.time()
+                        if end - start > 2:
+                            logger.warning(
+                                "Send throtttled.  Time delta={} seconds".format(end - start)
+                            )
 
     def handle_pingback_request_thread(self, worker_thread_info):
         """
