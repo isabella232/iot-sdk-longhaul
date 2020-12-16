@@ -20,7 +20,7 @@ from measurement import ThreadSafeCounter
 import azure_monitor
 from azure_monitor_metrics import MetricsReporter
 from out_of_order_message_tracker import OutOfOrderMessageTracker
-from utilities import get_random_length_string
+from thief_constants import PingbackType
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("paho").setLevel(level=logging.DEBUG)
@@ -31,11 +31,7 @@ logger = logging.getLogger("thief.{}".format(__name__))
 
 # TODO: exit service when device stops responding
 # TODO: add code to receive rest of pingacks at end.  wait for delta since last to be > 20 seconds.
-# TODO: add config for "how long must a message be missing before we consider it actually missing".
-# TODO: add device_id to service logs as extra parameter
-# TODO: add code to update desired properties when unpairing device.
 # TODO: add mid to debug logs as custom property, maybe pingback id
-# TODO: device send exit message to service
 
 # use os.environ[] for required environment variables
 provisioning_host = os.environ["THIEF_DEVICE_PROVISIONING_HOST"]
@@ -44,11 +40,7 @@ group_symmetric_key = os.environ["THIEF_DEVICE_GROUP_SYMMETRIC_KEY"]
 registration_id = os.environ["THIEF_DEVICE_ID"]
 requested_service_pool = os.environ["THIEF_REQUESTED_SERVICE_POOL"]
 
-# use os.getenv() for optional environment variables
-run_id = os.getenv("THIEF_DEVICE_APP_RUN_ID")
-
-if not run_id:
-    run_id = str(uuid.uuid4())
+run_id = str(uuid.uuid4())
 
 # configure our traces and events to go to Azure Monitor
 azure_monitor.add_logging_properties(
@@ -66,12 +58,6 @@ azure_monitor.log_to_azure_monitor("paho")
 PingbackWaitInfo = collections.namedtuple(
     "PingbackWaitInfo", "on_pingback_received pingback_id send_epochtime pingback_type user_data"
 )
-
-
-class PingbackType(object):
-    TELEMETRY_PINGBACK = "telemetry"
-    ADD_REPORTED_PROPERTY_PINGBACK = "add_reported"
-    REMOVE_REPORTED_PROPERTY_PINGBACK = "remove_reported"
 
 
 class DeviceRunMetrics(object):
@@ -129,7 +115,7 @@ class DeviceRunConfig(object):
         # How many threads do we spin up for overlapped send_message calls.  These threads
         # pull messages off of a single outgoing queue.  If all of the send_message threads
         # are busy, outgoing messages will just pile up in the queue.
-        self.send_test_message_thread_count = 10
+        self.send_message_thread_count = 10
 
         # How long do we wait for notification that the service app received a
         # message before we consider it a failure?
@@ -154,8 +140,8 @@ class DeviceRunConfig(object):
         # Be careful with this.  Too often will result in throttling on the service, which has 1.83  messages/sec/unit as a shared limit for all devices
         self.receive_message_interval_in_seconds = 20
 
-        # How big, in bytes, do we we want the random text size in test C2D messages to be
-        self.receive_message_filler_size = 16 * 1024
+        # How big, in bytes, is the maximum random text size in test C2D messages to be
+        self.receive_message_max_filler_size = 16 * 1024
 
         # How many missing C2D messages will cause the test to fail?
         self.receive_message_missing_message_allowed_failure_count = 100
@@ -165,9 +151,6 @@ class DeviceRunConfig(object):
 
         # How many reported property patches are allowed to fail before we fail the test
         self.reported_properties_update_allowed_failure_count = 100
-
-        # Max size of reported property values, in count of characters
-        self.reported_properties_update_property_max_size = 16
 
         # How many seconds do we wait for the service to acknowledge a reported property update
         # before we consider it failed
@@ -189,7 +172,7 @@ class DeviceApp(app_base.AppBase):
         self.device_id = None
         self.metrics = DeviceRunMetrics()
         self.config = DeviceRunConfig()
-        self.service_app_run_id = None
+        self.service_run_id = None
         # for pingbacks
         self.pingback_list_lock = threading.Lock()
         self.pingback_wait_list = {}
@@ -199,9 +182,8 @@ class DeviceApp(app_base.AppBase):
         # for metrics
         self.reporter = MetricsReporter()
         self._configure_azure_monitor_metrics()
-        # for control messages
-        self.outgoing_control_message_queue = queue.Queue()
         # for pairing
+        self.pairing_complete = False
         self.incoming_pairing_message_queue = queue.Queue()
         self.pairing_id = None
         # for c2d
@@ -367,17 +349,16 @@ class DeviceApp(app_base.AppBase):
             "pairingRequestTimeoutIntervalInSeconds": self.config.pairing_request_timeout_interval_in_seconds,
             "pairingRequestSendIntervalInSeconds": self.config.pairing_request_send_interval_in_seconds,
             "sendMessageOperationsPerSecond": self.config.send_message_operations_per_second,
-            "sendMessageThreadCount": self.config.send_test_message_thread_count,
+            "sendMessageThreadCount": self.config.send_message_thread_count,
             "sendMessageArrivalFailureIntervalInSeconds": self.config.send_message_arrival_failure_interval_in_seconds,
             "sendMessageArrivalAllowedFailureCount": self.config.send_message_arrival_allowed_failure_count,
             "sendMessageBacklogAllowedFailureCount": self.config.send_message_backlog_allowed_failure_count,
             "sendMessageUnackedAllowedFailureCount": self.config.send_message_unacked_allowed_failure_count,
             "sendMessageExceptionAllowedFailureCount": self.config.send_message_exception_allowed_failure_count,
             "receiveMessageIntervalInSeconds": self.config.receive_message_interval_in_seconds,
-            "receiveMessageFillerSize": self.config.receive_message_filler_size,
+            "receiveMessageMaxFillerSize": self.config.receive_message_max_filler_size,
             "receiveMessageMissingMessageAllowedFailureCount": self.config.receive_message_missing_message_allowed_failure_count,
             "reportedPropertiesUpdateIntervalInSeconds": self.config.reported_properties_update_interval_in_seconds,
-            "reportedPropertiesUpdatePropertyMaxSize": self.config.reported_properties_update_property_max_size,
             "reportedPropertiesVerifyFailureIntervalInSeconds": self.config.reported_properties_verify_failure_interval_in_seconds,
             "reportedPropertiesUpdateAllowedFailureCount": self.config.reported_properties_update_allowed_failure_count,
         }
@@ -392,7 +373,8 @@ class DeviceApp(app_base.AppBase):
                 "sessionMetrics": self.get_session_metrics(),
                 "testMetrics": self.get_test_metrics(),
                 "config": self.get_longhaul_config_properties(),
-                "propertyTest": None,
+                "testContent": None,
+                "testControl": None,
             }
         }
         self.client.patch_twin_reported_properties(props)
@@ -404,8 +386,8 @@ class DeviceApp(app_base.AppBase):
 
         # Note: we're changing the dictionary that the user passed in.
         # This isn't the best idea, but it works and it saves us from deep copies
-        if self.service_app_run_id:
-            props["thief"]["serviceAppRunId"] = self.service_app_run_id
+        if self.service_run_id:
+            props["thief"]["serviceRunId"] = self.service_run_id
         props["thief"]["pairingId"] = self.pairing_id
 
         # This function only creates the message.  The caller needs to queue it up for sending.
@@ -453,19 +435,15 @@ class DeviceApp(app_base.AppBase):
         service app responsible for multiple device apps.  The pairing process works
         like this:
 
-        1. The device sends a pairingRequest message stating what perferences it has about its
-             prospective partner along with a pairingId value that we can use to discriminate
-             this partnership with other (previous) pairings.
-
-        2. All service apps watch for all pairingRequest messages.  If some service app instance
-            wants to get paired with a device, it sends a pairingResponse message to the device.
-
-            If multiple service apps send the message, the winner is chosen by the
-            device app, probably based on what message comes in first.
-
-        3. Once the device decides on a service app, it sets serviceAppRunId and pairingId
-            in all messages it sends.  When the service sees this value, it can know whether
-            it was chosen by the device.
+        1. Device sets reported properties in `properties/reported/thief/pairing` which indicates
+            that it doesn't have a service app (by settign `serviceRunId` = None).
+        2. An available service sets `properties/desired/thief/pairing/serviceRunId` to the service
+            app's `runId` value
+        3. The device sets `properties/reported/thief/pairing/serviceRunId` to the serivce app's
+            `runId` value.
+        4. When the service sees that the device accepted it, it sets
+            `properties/desired/thief/pairing/acceptedPairing`.  At this point, the pairing is
+            considered to be "complete" and testing can begin.
 
         Right now, there is no provision for a failing service app.  In the future, the device
         code _could_ see that the service app isn't responding and start the pairing process
@@ -487,21 +465,11 @@ class DeviceApp(app_base.AppBase):
             except queue.Empty:
                 msg = None
 
-            # We trigger a pairing operation by pushing this string into our incoming queue.
-            # Not a great design, but it lets us group this functionality into a single thread
-            # without adding another signalling mechanism.
-            if msg == "START_PAIRING":
-                currently_pairing = True
-                pairing_start_epochtime = time.time()
-                pairing_last_request_epochtime = 0
-                self.pairing_id = str(uuid.uuid4())
-                self.service_run_app_id = None
-                azure_monitor.add_logging_properties(pairing_id=self.pairing_id)
-                logger.info("Starting pairing operation")
-                # set msg to None to trigger the block that sends the first pairingRequest message
-                msg = None
-
+            repeat_pairing_request = False
             if not msg and currently_pairing:
+                # if we're trying to pair and we haven't seen a response yet, we may need to
+                # re-send our request (by setting the desired property again), or it may be
+                # time to fail the pairing operation
                 if (
                     time.time() - pairing_start_epochtime
                 ) > self.config.pairing_request_timeout_interval_in_seconds:
@@ -514,34 +482,94 @@ class DeviceApp(app_base.AppBase):
                 elif (
                     time.time() - pairing_last_request_epochtime
                 ) > self.config.pairing_request_send_interval_in_seconds:
+                    logger.info("pairing response timeout.  Requesting again")
+                    repeat_pairing_request = True
 
-                    logger.info("sending pairingRequest message")
-                    pairing_request = {
-                        "thief": {
-                            "cmd": "pairingRequest",
+            # We trigger a pairing operation by pushing this string into our incoming queue.
+            # Not a great design, but it lets us group this functionality into a single thread
+            # without adding another signalling mechanism.
+            if msg == "START_PAIRING":
+                pairing_start_epochtime = time.time()
+            if msg == "START_PAIRING" or repeat_pairing_request:
+                # Set our reported properties to start a pairing operation or to try again if no
+                # service has responded yet.
+                logger.info("Starting pairing operation")
+                currently_pairing = True
+                self.pairing_complete = False
+                pairing_last_request_epochtime = time.time()
+                self.pairing_id = str(uuid.uuid4())
+                self.service_run_id = None
+                props = {
+                    "thief": {
+                        "pairing": {
                             "requestedServicePool": requested_service_pool,
+                            "serviceRunId": None,
+                            "pairingId": self.pairing_id,
+                            "deviceRunId": run_id,
                         }
                     }
-                    msg = self.create_message_from_dict(pairing_request)
-                    self.outgoing_control_message_queue.put(msg)
+                }
+                logger.info("updating pairing reported props: {}".format(pprint.pformat(props)))
+                self.client.patch_twin_reported_properties(props)
+                azure_monitor.add_logging_properties(pairing_id=self.pairing_id)
 
-                    pairing_last_request_epochtime = time.time()
+            elif msg and isinstance(msg, dict):
+                # is msg is a dict, that means we have a desired property change.  A service
+                # might be trying to pair with us.
+                logger.info("received pairing desired props: {}".format(pprint.pformat(msg)))
 
-            elif msg:
-                if currently_pairing:
-                    thief = json.loads(msg.data.decode()).get("thief")
-                    if thief["cmd"] == "pairingResponse":
-                        service_app_run_id = thief["serviceAppRunId"]
-                        logger.info(
-                            "Service app {} claimed this device instance".format(service_app_run_id)
+                pairing = msg.get("thief", {}).get("pairing", {})
+                pairing_id = pairing.get("pairingId", None)
+                service_run_id = pairing.get("serviceRunId", None)
+                accepted_pairing = pairing.get("acceptedPairing", None)
+
+                if accepted_pairing == "{},{}".format(self.pairing_id, self.service_run_id):
+                    # This is the final part of the pairing.  Once `acceptedPairing` is set, we're
+                    # done
+                    logger.info("Pairing accepted by service")
+                    self.on_pairing_complete()
+
+                elif self.service_run_id:
+                    # It's possible that a second service app tried to pair with us after we
+                    # already chose someone else.  Ignore this
+                    logger.info("Already paired.  Ignoring.")
+
+                elif not pairing_id or not service_run_id:
+                    # Or maybe something is wrong with the desired properties.  Probably a
+                    # service app that goes by different rules. Ignoring it is better than
+                    # crashing.
+                    logger.info("pairingId and/or serviceRunId missing.  Ignoring.")
+
+                elif pairing_id != self.pairing_id:
+                    # Another strange case.  A service app is trying to pair with us, but it's
+                    # using a different `pairingId` value.  It's possible that we had to
+                    # repeat the pairing request and a service is responding to the older
+                    # request.  Ignore this.
+                    logger.info(
+                        "pairingId mismatch.  Ignoring. (received {}, expected {})".format(
+                            pairing_id, self.pairing_id
                         )
-                        self.service_app_run_id = service_app_run_id
-                        currently_pairing = False
-
-                        self.on_pairing_complete()
+                    )
 
                 else:
-                    logger.info("Ignoring pairing response: {}".format(msg.data.decode()))
+                    # It looks like a service app has decided to pair with us.  Set reported
+                    # properties to "select" this service instance as our partner.
+                    logger.info(
+                        "Service app {} claimed this device instance".format(service_run_id)
+                    )
+                    currently_pairing = False
+                    self.service_run_id = service_run_id
+                    props = {
+                        "thief": {
+                            "pairing": {
+                                "serviceRunId": self.service_run_id,
+                                "pairingId": self.pairing_id,
+                            }
+                        }
+                    }
+                    currently_pairing = False
+                    logger.info("updating pairing reported props: {}".format(pprint.pformat(props)))
+                    self.client.patch_twin_reported_properties(props)
 
     def start_pairing(self):
         """
@@ -553,22 +581,23 @@ class DeviceApp(app_base.AppBase):
         """
         return True if the pairing process is complete
         """
-        return self.pairing_id and self.service_app_run_id
+        return self.pairing_id and self.service_run_id and self.pairing_complete
 
     def on_pairing_complete(self):
         """
         Called when pairing is complete
         """
         logger.info("Pairing is complete.  Starting c2d")
+        self.pairing_complete = True
         self.start_c2d_message_sending()
 
-    def send_test_message_thread(self, worker_thread_info):
+    def send_message_thread(self, worker_thread_info):
         """
         Thread which reads the telemetry queue and sends the telemetry.  Since send_message is
         blocking, and we want to overlap send_messsage calls, we create multiple
-        send_test_message_thread instances so we can send multiple messages at the same time.
+        send_message_thread instances so we can send multiple messages at the same time.
 
-        The number of send_test_message_thread instances is the number of overlapped sent operations
+        The number of send_message_thread instances is the number of overlapped sent operations
         we can have
         """
         while not self.done.isSet():
@@ -594,6 +623,10 @@ class DeviceApp(app_base.AppBase):
                     self.metrics.send_message_count_unacked.decrement()
 
     def send_metrics_to_azure_monitor(self, props):
+        """
+        Send metrics to azure monitor, based on the reported properties that we probably just
+        sent to the hub
+        """
         # we don't record session_metrics to azure monitor
 
         system_health_metrics = props["systemHealthMetrics"]
@@ -626,7 +659,7 @@ class DeviceApp(app_base.AppBase):
         Thread to continuously send d2c messages throughout the longhaul run.  This thread doesn't
         actually send messages becauase send_message is blocking and we want to overlap our send
         operations.  Instead, this thread adds the messsage to a queue, and relies on a
-        send_test_message_thread instance to actually send the message.
+        send_message_thread instance to actually send the message.
         """
 
         while not self.done.isSet():
@@ -636,7 +669,6 @@ class DeviceApp(app_base.AppBase):
                 continue
 
             if self.is_pairing_complete():
-
                 props = {
                     "thief": {
                         "sessionMetrics": self.get_session_metrics(),
@@ -652,7 +684,7 @@ class DeviceApp(app_base.AppBase):
                     logger.info("received pingback with pingbackId = {}".format(pingback_id))
                     self.metrics.send_message_count_received_by_service_app.increment()
 
-                # This function only queues the message.  A send_test_message_thread instance will pick
+                # This function only queues the message.  A send_message_thread instance will pick
                 # it up and send it.
                 msg = self.create_message_from_dict_with_pingback(
                     props=props,
@@ -699,6 +731,26 @@ class DeviceApp(app_base.AppBase):
 
             self.done.wait(self.config.thief_property_update_interval_in_seconds)
 
+    def wait_for_desired_properties_thread(self, worker_thread_info):
+        """
+        Thread which waits for desired property patches and puts them into
+        queues for other threads to handle
+        """
+        while not self.done.isSet():
+            worker_thread_info.watchdog_epochtime = time.time()
+            if self.is_paused():
+                time.sleep(1)
+                continue
+
+            props = self.client.receive_twin_desired_properties_patch(timeout=30)
+            if props:
+                # props that have the pairing structure go to `incoming_pairing_message_queue`
+                if props.get("thief", {}).get("pairing", {}):
+                    self.incoming_pairing_message_queue.put(props)
+
+                # Other props get dropped.  Eventually we'll use this to test desired properties.
+                # self.incoming_desired_property_patch_queue.put(props)
+
     def dispatch_incoming_message_thread(self, worker_thread_info):
         """
         Thread which continuously receives c2d messages throughout the test run.  This
@@ -712,27 +764,31 @@ class DeviceApp(app_base.AppBase):
                 time.sleep(1)
                 continue
 
-            msg = self.client.receive_message(timeout=1)
+            msg = self.client.receive_message(timeout=30)
 
             if msg:
                 obj = json.loads(msg.data.decode())
                 thief = obj.get("thief")
 
                 if thief and thief["pairingId"] == self.pairing_id:
+                    # We only inspect messages that have `thief/pairingId` set to our `pairingId` value.
                     cmd = thief["cmd"]
                     if cmd == "pingbackResponse":
+                        # If this is a pingback response, we put it into `incoming_pingback_response_queue`
+                        # for another thread to handle.
                         logger.info("received {} message with {}".format(cmd, thief["pingbacks"]))
                         self.incoming_pingback_response_queue.put(msg)
-                    elif cmd == "pairingResponse":
-                        logger.info("received {} message".format(cmd))
-                        self.incoming_pairing_message_queue.put(msg)
+
                     elif cmd == "testC2d":
+                        # If thie is a test C2D messages, we put it into `incoming_test_c2d_message_queue`
+                        # for another thread to handle.
                         logger.info(
                             "received {} message with index {}".format(
                                 cmd, thief["testC2dMessageIndex"]
                             )
                         )
                         self.incoming_test_c2d_message_queue.put(msg)
+
                     else:
                         logger.warning("Unknown command received: {}".format(obj))
 
@@ -741,7 +797,9 @@ class DeviceApp(app_base.AppBase):
 
     def handle_pingback_response_thread(self, worker_thread_info):
         """
-        Thread which handles incoming pingback responses.
+        Thread which handles incoming pingback responses.  This is where we go through the list
+        of `pingbackId` values that we received and call the appropriate callbacks to indicate that
+        the service has responded.
         """
 
         while not self.done.isSet():
@@ -927,22 +985,24 @@ class DeviceApp(app_base.AppBase):
 
     def start_c2d_message_sending(self):
         """
-        send a message to the server to start c2d messages flowing
+        set a reported property to start c2d messages flowing
         """
-        # TODO: add a timeout here, make sure the messages, and make sure messages actually flow
-
-        logger.info("Sending message to service to start c2d messages:")
+        # TODO: add a timeout here, make sure the messages are correct, and make sure messages actually flow
 
         props = {
             "thief": {
-                "cmd": "startC2dMessageSending",
-                "messageIntervalInSeconds": self.config.receive_message_interval_in_seconds,
-                "fillerSize": self.config.receive_message_filler_size,
+                "testControl": {
+                    "c2d": {
+                        "send": True,
+                        "messageIntervalInSeconds": self.config.receive_message_interval_in_seconds,
+                        "maxFillerSize": self.config.receive_message_max_filler_size,
+                    }
+                }
             }
         }
 
-        msg = self.create_message_from_dict(props)
-        self.outgoing_control_message_queue.put(msg)
+        logger.info("Enabling C2d message testing: {}".format(props))
+        self.client.patch_twin_reported_properties(props)
 
     def handle_incoming_test_c2d_messages_thread(self, worker_thread_info):
         """
@@ -965,35 +1025,16 @@ class DeviceApp(app_base.AppBase):
                 self.metrics.receive_message_count_received.increment()
                 self.out_of_order_message_tracker.add_message(thief.get("testC2dMessageIndex"))
 
-    def send_control_message_thread(self, worker_thread_info):
-        """
-        Thread which reads the control message queue and sends the message.  We probably don't
-        need this queue since we're not trying to overlap control messages, but it can't hurt
-        and it mirrors how test messages work.
-        """
-        while not self.done.isSet():
-            # We do not check is_pairing_complete here because we use this thread to
-            # send pairing requests.
-            worker_thread_info.watchdog_epochtime = time.time()
-            if self.is_paused():
-                time.sleep(1)
-                continue
-
-            try:
-                msg = self.outgoing_control_message_queue.get(timeout=1)
-            except queue.Empty:
-                msg = None
-            if msg:
-                try:
-                    self.client.send_message(msg)
-                except Exception as e:
-                    logger.warning(
-                        "send_message raised {} sending a control messsage.  Ignoring".format(
-                            type(e)
-                        )
-                    )
-
     def test_reported_properties_threads(self, worker_thread_info):
+        """
+        Thread to test reported properties.  It does this by setting properties inside
+        `properties/reported/thief/testContent/reportedPropertyTest`.  Each property has
+        a `addPingbackId` value and a `removePingbackId` value.  When  the service sees the
+        property added, it sends the `addPingbackId` to the device.  When the service sees the
+        property removed, it sends the `removePingbackid` to the device. This way the device
+        can add a property, verify that it was added, then remove it and verify that it was removed.
+        """
+
         property_index = 1
 
         while not self.done.isSet():
@@ -1003,15 +1044,14 @@ class DeviceApp(app_base.AppBase):
                 continue
 
             if self.is_pairing_complete():
-                property_name = "prop_{}".format(property_index)
-                property_value = get_random_length_string(
-                    self.config.reported_properties_update_property_max_size
-                )
+                add_pingback_id = str(uuid.uuid4())
+                remove_pingback_id = str(uuid.uuid4())
 
-                reported_properties = {"thief": {"propertyTest": {property_name: property_value}}}
-                logger.info("Adding test property {}".format(property_name))
-                self.client.patch_twin_reported_properties(reported_properties)
-                self.metrics.reported_properties_count_added.increment()
+                property_name = "prop_{}".format(property_index)
+                property_value = {
+                    "addPingbackId": add_pingback_id,
+                    "removePingbackId": remove_pingback_id,
+                }
 
                 def on_property_added(pingback_id, user_data):
                     self.metrics.reported_properties_count_added_and_verified_by_service_app.increment()
@@ -1022,26 +1062,14 @@ class DeviceApp(app_base.AppBase):
                         )
                     )
 
-                    reported_properties = {"thief": {"propertyTest": {added_property_name: None}}}
+                    reported_properties = {
+                        "thief": {
+                            "testContent": {"reportedPropertyTest": {added_property_name: None}}
+                        }
+                    }
                     logger.info("Removing test property {}".format(added_property_name))
                     self.client.patch_twin_reported_properties(reported_properties)
                     self.metrics.reported_properties_count_removed.increment()
-
-                    logger.info(
-                        "Sending request to verify that property {} was removed".format(
-                            added_property_name
-                        )
-                    )
-                    property_removed_pingback_request = {
-                        "thief": {"propertyName": added_property_name}
-                    }
-                    msg = self.create_message_from_dict_with_pingback(
-                        props=property_removed_pingback_request,
-                        on_pingback_received=on_property_removed,
-                        pingback_type=PingbackType.REMOVE_REPORTED_PROPERTY_PINGBACK,
-                        user_data=property_name,
-                    )
-                    self.outgoing_control_message_queue.put(msg)
 
                 def on_property_removed(pingback_id, user_data):
                     self.metrics.reported_properties_count_removed_and_verified_by_service_app.increment()
@@ -1052,20 +1080,30 @@ class DeviceApp(app_base.AppBase):
                         )
                     )
 
-                logger.info(
-                    "sending request to verify that property {} was added".format(property_name)
-                )
-                property_added_pingback_request = {
-                    "thief": {"propertyName": property_name, "propertyLength": len(property_value)}
-                }
+                with self.pingback_list_lock:
+                    self.pingback_wait_list[add_pingback_id] = PingbackWaitInfo(
+                        on_pingback_received=on_property_added,
+                        pingback_id=add_pingback_id,
+                        send_epochtime=time.time(),
+                        pingback_type=PingbackType.ADD_REPORTED_PROPERTY_PINGBACK,
+                        user_data=property_name,
+                    )
+                    self.pingback_wait_list[remove_pingback_id] = PingbackWaitInfo(
+                        on_pingback_received=on_property_removed,
+                        pingback_id=remove_pingback_id,
+                        send_epochtime=time.time(),
+                        pingback_type=PingbackType.REMOVE_REPORTED_PROPERTY_PINGBACK,
+                        user_data=property_name,
+                    )
 
-                msg = self.create_message_from_dict_with_pingback(
-                    props=property_added_pingback_request,
-                    on_pingback_received=on_property_added,
-                    pingback_type=PingbackType.ADD_REPORTED_PROPERTY_PINGBACK,
-                    user_data=property_name,
-                )
-                self.outgoing_control_message_queue.put(msg)
+                reported_properties = {
+                    "thief": {
+                        "testContent": {"reportedPropertyTest": {property_name: property_value}}
+                    }
+                }
+                logger.info("Adding test property {}".format(property_name))
+                self.client.patch_twin_reported_properties(reported_properties)
+                self.metrics.reported_properties_count_added.increment()
 
                 property_index += 1
 
@@ -1099,6 +1137,9 @@ class DeviceApp(app_base.AppBase):
                 self.update_thief_properties_thread, "update_thief_properties_thread"
             ),
             app_base.WorkerThreadInfo(
+                self.wait_for_desired_properties_thread, "wait_for_desired_properties_thread"
+            ),
+            app_base.WorkerThreadInfo(
                 self.handle_pingback_response_thread, "handle_pingback_response_thread"
             ),
             app_base.WorkerThreadInfo(self.test_send_message_thread, "test_send_message_thread"),
@@ -1109,16 +1150,13 @@ class DeviceApp(app_base.AppBase):
             ),
             app_base.WorkerThreadInfo(self.pairing_thread, "pairing_thread"),
             app_base.WorkerThreadInfo(
-                self.send_control_message_thread, "send_control_message_thread"
-            ),
-            app_base.WorkerThreadInfo(
                 self.test_reported_properties_threads, "test_reported_properties_threads"
             ),
         ]
-        for i in range(0, self.config.send_test_message_thread_count):
+        for i in range(0, self.config.send_message_thread_count):
             worker_thread_infos.append(
                 app_base.WorkerThreadInfo(
-                    self.send_test_message_thread, "send_test_message_thread #{}".format(i),
+                    self.send_message_thread, "send_message_thread #{}".format(i),
                 )
             )
 
@@ -1128,12 +1166,16 @@ class DeviceApp(app_base.AppBase):
 
         logger.info("Exiting main at {}".format(datetime.datetime.utcnow()))
 
-        # 60 seconds to let app insights data flush
-        time.sleep(60)
-
     def disconnect(self):
         self.client.disconnect()
 
 
 if __name__ == "__main__":
-    DeviceApp().main()
+    try:
+        DeviceApp().main()
+    except Exception as e:
+        logger.error("App shutdown exception: {}".format(str(e)), exc_info=True)
+        raise
+    finally:
+        # Flush azure monitor telemetry
+        logging.shutdown()

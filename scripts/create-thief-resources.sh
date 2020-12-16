@@ -22,7 +22,7 @@ export THIEF_KEYVAULT_NAME=${THIEF_PREFIX}-thief-kv
 ##############################
 # add the app insights az extension
 ##############################
-echo az extension add --name application-insights
+az extension add --name application-insights
 
 ##############################
 # create resoruce groups
@@ -38,10 +38,10 @@ BASE_QUERY_ARGS="\
     --subscription ${THIEF_SUBSCRIPTION_ID} \
     "
 
-echo az group create \
+az group create \
     ${BASE_CREATE_ARGS} \
     --name ${THIEF_RESOURCE_GROUP}
-echo az group create \
+az group create \
     ${BASE_CREATE_ARGS} \
     --name ${THIEF_RUNS_RESOURCE_GROUP}
 
@@ -68,7 +68,7 @@ export THIEF_ACTIVE_DIRECTORY_TENANT="$(\
 ##############################
 # create keyvault
 ##############################
-echo az keyvault create \
+az keyvault create \
     ${BASE_CREATE_ARGS} \
     --name ${THIEF_KEYVAULT_NAME}
 
@@ -77,7 +77,7 @@ echo az keyvault create \
 # create container registry
 ##############################
 export THIEF_CONTAINER_REGISTRY_SHORTNAME=${THIEF_PREFIX}thiefcr
-echo az acr create \
+az acr create \
     ${BASE_CREATE_ARGS} \
     --sku Standard \
     --admin-enabled true \
@@ -109,7 +109,7 @@ export THIEF_CONTAINER_REGISTRY_HOST="$(\
 # create iothub
 ##############################
 export THIEF_IOTHUB_NAME=${THIEF_PREFIX}-thief-hub
-echo az iot hub create \
+az iot hub create \
     ${BASE_CREATE_ARGS} \
     --name ${THIEF_IOTHUB_NAME} \
     --sku S1 \
@@ -123,6 +123,16 @@ export THIEF_SERVICE_CONNECTION_STRING="$(\
         -o tsv \
     )"
 
+
+##############################
+# add a route to send to eventhub when twins are updated
+##############################
+az iot hub route create \
+    --hub-name ${THIEF_IOTHUB_NAME} \
+    --subscription ${THIEF_SUBSCRIPTION_ID} \
+    --route-name twin-udpate-event \
+    --endpoint-name events \
+    --source-type twinchangeevents
 
 ##############################
 # get eventhub strings
@@ -141,7 +151,7 @@ export THIEF_EVENTHUB_CONNECTION_STRING="$(\
 # Create DPS instance
 ##############################
 THIEF_DPS_INSTANCE_NAME=${THIEF_PREFIX}-thief-dps
-echo az iot dps create \
+az iot dps create \
     ${BASE_CREATE_ARGS} \
     --name ${THIEF_DPS_INSTANCE_NAME}
    
@@ -163,12 +173,12 @@ export THIEF_DEVICE_ID_SCOPE="$(\
 
 THIEF_ENROLLMENT_ID=${THIEF_PREFIX}-thief-enrollment
 
-echo az iot dps linked-hub create \
+az iot dps linked-hub create \
     ${BASE_CREATE_ARGS} \
     --dps-name ${THIEF_DPS_INSTANCE_NAME} \
     --connection-string "${THIEF_SERVICE_CONNECTION_STRING}"
 
-echo az iot dps enrollment-group create \
+az iot dps enrollment-group create \
     --resource-group ${THIEF_RESOURCE_GROUP} \
     --subscription ${THIEF_SUBSCRIPTION_ID} \
     --iot-hub-host-name ${THIEF_IOTHUB_NAME}.azure-devices.net \
@@ -193,7 +203,7 @@ export THIEF_DEVICE_GROUP_SYMMETRIC_KEY="$(\
 ##############################
 
 export THIEF_APP_INSIGHTS_NAME=${THIEF_IOTHUB_NAME}
-echo az monitor app-insights component create \
+az monitor app-insights component create \
     ${BASE_CREATE_ARGS} \
     --app ${THIEF_APP_INSIGHTS_NAME}
 
@@ -210,7 +220,7 @@ export THIEF_APP_INSIGHTS_CONNECTION_STRING="$(\
 # Creeate our managed identity
 ##############################
 THIEF_IDENTITY_NAME=${THIEF_PREFIX}-container-identity
-echo az identity create \
+az identity create \
     ${BASE_CREATE_ARGS} \
     --name ${THIEF_IDENTITY_NAME}
 
@@ -235,7 +245,7 @@ THIEF_USER_OBJECT_ID="$(\
 # (so we can get secrets from inside the container).
 ##############################
 
-echo az keyvault set-policy \
+az keyvault set-policy \
     ${BASE_QUERY_ARGS} \
     --name ${THIEF_KEYVAULT_NAME} \
     --secret-permissions get \

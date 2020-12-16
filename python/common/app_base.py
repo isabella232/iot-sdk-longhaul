@@ -208,5 +208,5 @@ class AppBase(object):
             logger.info("Done disconnecting.  Exiting")
 
         if self.metrics.run_state == FAILED:
-            logger.info("Forcing exit")
-            sys.exit(1)
+            logger.error("Forcing exit")
+            raise Exception("Run failed: {}".format(self.metrics.exit_reason))
