@@ -10,6 +10,7 @@ import sys
 import platform
 import os
 import traceback
+import pdb
 from system_health_telemetry import SystemHealthTelemetry
 
 
@@ -64,6 +65,13 @@ class AppBase(object):
         return True if threads should be paused.
         """
         return self.paused
+
+    def breakpoint(self):
+        """
+        Pause all threads and break into the debugger
+        """
+        self.pause_all_threads()
+        pdb.set_trace()
 
     def get_system_properties(self, version):
         return {

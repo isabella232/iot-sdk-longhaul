@@ -20,7 +20,7 @@ from measurement import ThreadSafeCounter
 import azure_monitor
 from azure_monitor_metrics import MetricsReporter
 from out_of_order_message_tracker import OutOfOrderMessageTracker
-from thief_constants import PingbackType
+from thief_constants import ServiceAckType
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("paho").setLevel(level=logging.DEBUG)
@@ -31,7 +31,7 @@ logger = logging.getLogger("thief.{}".format(__name__))
 
 # TODO: exit service when device stops responding
 # TODO: add code to receive rest of pingacks at end.  wait for delta since last to be > 20 seconds.
-# TODO: add mid to debug logs as custom property, maybe pingback id
+# TODO: add mid to debug logs as custom property, maybe service_ack id
 
 # use os.environ[] for required environment variables
 provisioning_host = os.environ["THIEF_DEVICE_PROVISIONING_HOST"]
@@ -55,8 +55,9 @@ azure_monitor.log_to_azure_monitor("thief")
 azure_monitor.log_to_azure_monitor("azure")
 azure_monitor.log_to_azure_monitor("paho")
 
-PingbackWaitInfo = collections.namedtuple(
-    "PingbackWaitInfo", "on_pingback_received pingback_id send_epochtime pingback_type user_data"
+ServiceAckWaitInfo = collections.namedtuple(
+    "ServiceAckWaitInfo",
+    "on_service_ack_received service_ack_id send_epochtime service_ack_type user_data",
 )
 
 
@@ -173,10 +174,10 @@ class DeviceApp(app_base.AppBase):
         self.metrics = DeviceRunMetrics()
         self.config = DeviceRunConfig()
         self.service_run_id = None
-        # for pingbacks
-        self.pingback_list_lock = threading.Lock()
-        self.pingback_wait_list = {}
-        self.incoming_pingback_response_queue = queue.Queue()
+        # for service_acks
+        self.service_ack_list_lock = threading.Lock()
+        self.service_ack_wait_list = {}
+        self.incoming_service_ack_response_queue = queue.Queue()
         # for telemetry
         self.outgoing_test_message_queue = queue.Queue()
         # for metrics
@@ -401,32 +402,36 @@ class DeviceApp(app_base.AppBase):
 
         return msg
 
-    def create_message_from_dict_with_pingback(
-        self, props, on_pingback_received, pingback_type, user_data=None
+    def create_message_from_dict_with_service_ack(
+        self, props, on_service_ack_received, service_ack_type, user_data=None
     ):
         """
-        helper function to create a message from a dict and add pingback
+        helper function to create a message from a dict and add service_ack
         properties.
         """
-        pingback_id = str(uuid.uuid4())
+        service_ack_id = str(uuid.uuid4())
 
         # Note: we're changing the dictionary that the user passed in.
         # This isn't the best idea, but it works and it saves us from deep copies
         assert props["thief"].get("cmd", None) is None
-        props["thief"]["cmd"] = "pingbackRequest"
-        props["thief"]["pingbackId"] = pingback_id
-        props["thief"]["pingbackType"] = pingback_type
+        props["thief"]["cmd"] = "serviceAckRequest"
+        props["thief"]["serviceAckId"] = service_ack_id
+        props["thief"]["serviceAckType"] = service_ack_type
 
-        with self.pingback_list_lock:
-            self.pingback_wait_list[pingback_id] = PingbackWaitInfo(
-                on_pingback_received=on_pingback_received,
-                pingback_id=pingback_id,
+        with self.service_ack_list_lock:
+            self.service_ack_wait_list[service_ack_id] = ServiceAckWaitInfo(
+                on_service_ack_received=on_service_ack_received,
+                service_ack_id=service_ack_id,
                 send_epochtime=time.time(),
-                pingback_type=pingback_type,
+                service_ack_type=service_ack_type,
                 user_data=user_data,
             )
 
-        logger.info("Requesting {} pingback for pingbackId = {}".format(pingback_type, pingback_id))
+        logger.info(
+            "Requesting {} service_ack for serviceAckId = {}".format(
+                service_ack_type, service_ack_id
+            )
+        )
         return self.create_message_from_dict(props)
 
     def pairing_thread(self, worker_thread_info):
@@ -513,6 +518,7 @@ class DeviceApp(app_base.AppBase):
                 self.client.patch_twin_reported_properties(props)
                 azure_monitor.add_logging_properties(pairing_id=self.pairing_id)
 
+            # TODO: basing this off isinstance is a weak design.  There should be a different way to decide what kind of operation this is.
             elif msg and isinstance(msg, dict):
                 # is msg is a dict, that means we have a desired property change.  A service
                 # might be trying to pair with us.
@@ -680,16 +686,18 @@ class DeviceApp(app_base.AppBase):
                 # push these same metrics to Azure Monitor
                 self.send_metrics_to_azure_monitor(props["thief"])
 
-                def on_pingback_received(pingback_id, user_data):
-                    logger.info("received pingback with pingbackId = {}".format(pingback_id))
+                def on_service_ack_received(service_ack_id, user_data):
+                    logger.info(
+                        "received service_ack with serviceAckId = {}".format(service_ack_id)
+                    )
                     self.metrics.send_message_count_received_by_service_app.increment()
 
                 # This function only queues the message.  A send_message_thread instance will pick
                 # it up and send it.
-                msg = self.create_message_from_dict_with_pingback(
+                msg = self.create_message_from_dict_with_service_ack(
                     props=props,
-                    on_pingback_received=on_pingback_received,
-                    pingback_type=PingbackType.TELEMETRY_PINGBACK,
+                    on_service_ack_received=on_service_ack_received,
+                    service_ack_type=ServiceAckType.TELEMETRY_SERVICE_ACK,
                 )
                 self.outgoing_test_message_queue.put(msg)
 
@@ -773,14 +781,14 @@ class DeviceApp(app_base.AppBase):
                 if thief and thief["pairingId"] == self.pairing_id:
                     # We only inspect messages that have `thief/pairingId` set to our `pairingId` value.
                     cmd = thief["cmd"]
-                    if cmd == "pingbackResponse":
-                        # If this is a pingback response, we put it into `incoming_pingback_response_queue`
+                    if cmd == "serviceAckResponse":
+                        # If this is a service_ack response, we put it into `incoming_service_ack_response_queue`
                         # for another thread to handle.
-                        logger.info("received {} message with {}".format(cmd, thief["pingbacks"]))
-                        self.incoming_pingback_response_queue.put(msg)
+                        logger.info("received {} message with {}".format(cmd, thief["serviceAcks"]))
+                        self.incoming_service_ack_response_queue.put(msg)
 
                     elif cmd == "testC2d":
-                        # If thie is a test C2D messages, we put it into `incoming_test_c2d_message_queue`
+                        # If this is a test C2D messages, we put it into `incoming_test_c2d_message_queue`
                         # for another thread to handle.
                         logger.info(
                             "received {} message with index {}".format(
@@ -795,10 +803,10 @@ class DeviceApp(app_base.AppBase):
                 else:
                     logger.warning("C2d received, but it's not for us: {}".format(obj))
 
-    def handle_pingback_response_thread(self, worker_thread_info):
+    def handle_service_ack_response_thread(self, worker_thread_info):
         """
-        Thread which handles incoming pingback responses.  This is where we go through the list
-        of `pingbackId` values that we received and call the appropriate callbacks to indicate that
+        Thread which handles incoming service_ack responses.  This is where we go through the list
+        of `serviceAckId` values that we received and call the appropriate callbacks to indicate that
         the service has responded.
         """
 
@@ -809,7 +817,7 @@ class DeviceApp(app_base.AppBase):
                 continue
 
             try:
-                msg = self.incoming_pingback_response_queue.get(timeout=1)
+                msg = self.incoming_service_ack_response_queue.get(timeout=1)
             except queue.Empty:
                 msg = None
 
@@ -817,21 +825,23 @@ class DeviceApp(app_base.AppBase):
                 arrivals = []
                 thief = json.loads(msg.data.decode())["thief"]
 
-                with self.pingback_list_lock:
-                    for pingback in thief["pingbacks"]:
-                        pingback_id = pingback["pingbackId"]
+                with self.service_ack_list_lock:
+                    for service_ack in thief["serviceAcks"]:
+                        service_ack_id = service_ack["serviceAckId"]
 
-                        if pingback_id in self.pingback_wait_list:
-                            # we've received a pingback.  Don't call back here because we're holding
-                            # pingback_lock_list.  Instead, add to a list and call back when we're
+                        if service_ack_id in self.service_ack_wait_list:
+                            # we've received a service_ack.  Don't call back here because we're holding
+                            # service_ack_list_lock.  Instead, add to a list and call back when we're
                             # not holding the lock.
-                            arrivals.append(self.pingback_wait_list[pingback_id])
-                            del self.pingback_wait_list[pingback_id]
+                            arrivals.append(self.service_ack_wait_list[service_ack_id])
+                            del self.service_ack_wait_list[service_ack_id]
                         else:
-                            logger.warning("Received unkonwn pingbackId: {}:".format(pingback_id))
+                            logger.warning(
+                                "Received unkonwn serviceAckId: {}:".format(service_ack_id)
+                            )
 
                 for arrival in arrivals:
-                    arrival.on_pingback_received(arrival.pingback_id, arrival.user_data)
+                    arrival.on_service_ack_received(arrival.service_ack_id, arrival.user_data)
 
     def check_for_failure_thread(self, worker_thread_info):
         """
@@ -859,15 +869,15 @@ class DeviceApp(app_base.AppBase):
             reported_properties_remove_failure_count = 0
             now = time.time()
 
-            with self.pingback_list_lock:
-                for pingback_wait_info in self.pingback_wait_list.values():
-                    if (pingback_wait_info.pingback_type == PingbackType.TELEMETRY_PINGBACK) and (
-                        now - pingback_wait_info.send_epochtime
+            with self.service_ack_list_lock:
+                for wait_info in self.service_ack_wait_list.values():
+                    if (wait_info.service_ack_type == ServiceAckType.TELEMETRY_SERVICE_ACK) and (
+                        now - wait_info.send_epochtime
                     ) > self.config.send_message_arrival_failure_interval_in_seconds:
                         logger.warning(
                             "arrival time for {} of {} seconds is longer than failure interval of {}".format(
-                                pingback_wait_info.pingback_id,
-                                (now - pingback_wait_info.send_epochtime),
+                                wait_info.service_ack_id,
+                                (now - wait_info.send_epochtime),
                                 self.config.send_message_arrival_failure_interval_in_seconds,
                             )
                         )
@@ -875,16 +885,16 @@ class DeviceApp(app_base.AppBase):
 
                     elif (
                         (
-                            pingback_wait_info.pingback_type
-                            == PingbackType.ADD_REPORTED_PROPERTY_PINGBACK
+                            wait_info.service_ack_type
+                            == ServiceAckType.ADD_REPORTED_PROPERTY_SERVICE_ACK
                         )
-                        and (now - pingback_wait_info.send_epochtime)
+                        and (now - wait_info.send_epochtime)
                         > self.config.reported_properties_update_interval_in_seconds
                     ):
                         logger.warning(
                             "reported property set time for {} of {} seconds is longer than failure interval of {}".format(
-                                pingback_wait_info.pingback_id,
-                                (now - pingback_wait_info.send_epochtime),
+                                wait_info.service_ack_id,
+                                (now - wait_info.send_epochtime),
                                 self.config.reported_properties_update_interval_in_seconds,
                             )
                         )
@@ -892,16 +902,16 @@ class DeviceApp(app_base.AppBase):
 
                     elif (
                         (
-                            pingback_wait_info.pingback_type
-                            == PingbackType.REMOVE_REPORTED_PROPERTY_PINGBACK
+                            wait_info.service_ack_type
+                            == ServiceAckType.REMOVE_REPORTED_PROPERTY_SERVICE_ACK
                         )
-                        and (now - pingback_wait_info.send_epochtime)
+                        and (now - wait_info.send_epochtime)
                         > self.config.reported_properties_update_interval_in_seconds
                     ):
                         logger.warning(
                             "reported property clear time for {} of {} seconds is longer than failure interval of {}".format(
-                                pingback_wait_info.pingback_id,
-                                (now - pingback_wait_info.send_epochtime),
+                                wait_info.service_ack_id,
+                                (now - wait_info.send_epochtime),
                                 self.config.reported_properties_update_interval_in_seconds,
                             )
                         )
@@ -1029,9 +1039,9 @@ class DeviceApp(app_base.AppBase):
         """
         Thread to test reported properties.  It does this by setting properties inside
         `properties/reported/thief/testContent/reportedPropertyTest`.  Each property has
-        a `addPingbackId` value and a `removePingbackId` value.  When  the service sees the
-        property added, it sends the `addPingbackId` to the device.  When the service sees the
-        property removed, it sends the `removePingbackid` to the device. This way the device
+        a `addServiceAckId` value and a `removeServiceAckId` value.  When  the service sees the
+        property added, it sends the `addServiceAckId` to the device.  When the service sees the
+        property removed, it sends the `removeServiceAckid` to the device. This way the device
         can add a property, verify that it was added, then remove it and verify that it was removed.
         """
 
@@ -1044,16 +1054,16 @@ class DeviceApp(app_base.AppBase):
                 continue
 
             if self.is_pairing_complete():
-                add_pingback_id = str(uuid.uuid4())
-                remove_pingback_id = str(uuid.uuid4())
+                add_service_ack_id = str(uuid.uuid4())
+                remove_service_ack_id = str(uuid.uuid4())
 
                 property_name = "prop_{}".format(property_index)
                 property_value = {
-                    "addPingbackId": add_pingback_id,
-                    "removePingbackId": remove_pingback_id,
+                    "addServiceAckId": add_service_ack_id,
+                    "removeServiceAckId": remove_service_ack_id,
                 }
 
-                def on_property_added(pingback_id, user_data):
+                def on_property_added(service_ack_id, user_data):
                     self.metrics.reported_properties_count_added_and_verified_by_service_app.increment()
                     added_property_name = user_data
                     logger.info(
@@ -1071,7 +1081,7 @@ class DeviceApp(app_base.AppBase):
                     self.client.patch_twin_reported_properties(reported_properties)
                     self.metrics.reported_properties_count_removed.increment()
 
-                def on_property_removed(pingback_id, user_data):
+                def on_property_removed(service_ack_id, user_data):
                     self.metrics.reported_properties_count_removed_and_verified_by_service_app.increment()
                     removed_property_name = user_data
                     logger.info(
@@ -1080,19 +1090,19 @@ class DeviceApp(app_base.AppBase):
                         )
                     )
 
-                with self.pingback_list_lock:
-                    self.pingback_wait_list[add_pingback_id] = PingbackWaitInfo(
-                        on_pingback_received=on_property_added,
-                        pingback_id=add_pingback_id,
+                with self.service_ack_list_lock:
+                    self.service_ack_wait_list[add_service_ack_id] = ServiceAckWaitInfo(
+                        on_service_ack_received=on_property_added,
+                        service_ack_id=add_service_ack_id,
                         send_epochtime=time.time(),
-                        pingback_type=PingbackType.ADD_REPORTED_PROPERTY_PINGBACK,
+                        service_ack_type=ServiceAckType.ADD_REPORTED_PROPERTY_SERVICE_ACK,
                         user_data=property_name,
                     )
-                    self.pingback_wait_list[remove_pingback_id] = PingbackWaitInfo(
-                        on_pingback_received=on_property_removed,
-                        pingback_id=remove_pingback_id,
+                    self.service_ack_wait_list[remove_service_ack_id] = ServiceAckWaitInfo(
+                        on_service_ack_received=on_property_removed,
+                        service_ack_id=remove_service_ack_id,
                         send_epochtime=time.time(),
-                        pingback_type=PingbackType.REMOVE_REPORTED_PROPERTY_PINGBACK,
+                        service_ack_type=ServiceAckType.REMOVE_REPORTED_PROPERTY_SERVICE_ACK,
                         user_data=property_name,
                     )
 
@@ -1140,7 +1150,7 @@ class DeviceApp(app_base.AppBase):
                 self.wait_for_desired_properties_thread, "wait_for_desired_properties_thread"
             ),
             app_base.WorkerThreadInfo(
-                self.handle_pingback_response_thread, "handle_pingback_response_thread"
+                self.handle_service_ack_response_thread, "handle_service_ack_response_thread"
             ),
             app_base.WorkerThreadInfo(self.test_send_message_thread, "test_send_message_thread"),
             app_base.WorkerThreadInfo(self.check_for_failure_thread, "check_for_failure_thread"),

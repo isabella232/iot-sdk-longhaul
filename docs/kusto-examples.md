@@ -18,8 +18,8 @@ Example queries to run:
 ```
 // All traces in a specific 2 minutre window
 traces
-| where timestamp > datetime(2020-11-06 02:13:30) 
-| where timestamp < datetime(2020-11-06 02:15:00) 
+| where timestamp > datetime(2020-11-06 02:13:30)
+| where timestamp < datetime(2020-11-06 02:15:00)
 | where customDimensions.deviceId == "nov4-1"
 | sort by timestamp asc
 ```
@@ -29,7 +29,7 @@ traces
 traces
 | where timestamp > ago(2d)
 | where customDimensions.deviceId == "nov4-1"
-| where customDimensions.module == "out_of_order_message_tracker" 
+| where customDimensions.module == "out_of_order_message_tracker"
 | where customDimensions.lineNumber == 61
 | sort by timestamp desc
 | limit 200
@@ -41,14 +41,14 @@ customMetrics
 | where timestamp > ago(7d)
 | where customDimensions.deviceId == "nov9-3"
 | where name == "sendMessageCountSent"
-| summarize avg(value) by bin(timestamp, 15m) 
+| summarize avg(value) by bin(timestamp, 15m)
 ```
 
 ```
 // logs from client.py (Paho) that don't contain the words "PINGREQ" and "PINGRESP"
 traces
 | where timestamp > ago(7d)
-| where customDimensions.deviceId == "nov9-3"  
+| where customDimensions.deviceId == "nov9-3"
 | where customDimensions.module == "client"
 | where message !has "PINGREQ" and message !has "PINGRESP"
 | sort by timestamp desc

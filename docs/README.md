@@ -21,9 +21,15 @@ You do **not** need to configure your workstation if you want to:
 
 ## Watching Tests
 * [Looking at test status using a CLI tool](./cli-tools.md)
-* [Reading test logs and metrics using Azure Monitor](./azure-monitor-logs.md)
+* [Reading test logs and metrics using Azure Monitor](./kusto-examples.md)
 
 ## Implementation Details
 * [Environment variables](./environment-variables.md)
 * [Names and IDs](./names-and-ids.md)
+* [Pairing process and schemas](./pairing.md)
+* [Reported property schemas](./reported-properties.md)
+* [Azure Monitor schemas](./azure-monitor-logging.md)
+* [Test control properties](./test-control.md)
+* [Test content properties](./test-content.md)
+
 

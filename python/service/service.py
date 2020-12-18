@@ -18,7 +18,7 @@ import azure.iot.hub.constant
 from azure.eventhub import EventHubConsumerClient
 import azure_monitor
 from utilities import get_random_length_string
-from thief_constants import PingbackType
+from thief_constants import ServiceAckType
 
 
 logging.basicConfig(format="%(asctime)s %(levelname)s:%(message)s", level=logging.WARNING)
@@ -50,7 +50,7 @@ azure_monitor.log_to_azure_monitor("azure")
 azure_monitor.log_to_azure_monitor("uamqp")
 
 
-Pingback = collections.namedtuple("Pingback", "device_id pingback_id")
+ServiceAck = collections.namedtuple("ServiceAck", "device_id service_ack_id")
 
 # TODO: remove items from pairing list of no traffic for X minutes
 
@@ -147,8 +147,8 @@ class ServiceApp(app_base.AppBase):
         # for any kind of c2d
         self.outgoing_c2d_queue = queue.Queue()
 
-        # for pingbacks
-        self.outgoing_pingback_response_queue = queue.Queue()
+        # for service_acks
+        self.outgoing_service_ack_response_queue = queue.Queue()
 
         # for pairing
         self.incoming_pairing_request_queue = queue.Queue()
@@ -226,22 +226,26 @@ class ServiceApp(app_base.AppBase):
                     device_data = self.paired_devices.get(device_id, None)
 
                 if device_data:
-                    if cmd == "pingbackRequest":
-                        pingback_type = thief.get("pingbackType", PingbackType.TELEMETRY_PINGBACK)
+                    if cmd == "serviceAckRequest":
+                        service_ack_type = thief.get(
+                            "serviceAckType", ServiceAckType.TELEMETRY_SERVICE_ACK
+                        )
 
-                        if pingback_type == PingbackType.TELEMETRY_PINGBACK:
+                        if service_ack_type == ServiceAckType.TELEMETRY_SERVICE_ACK:
                             logger.info(
-                                "received telemetry pingback request from {} with pingbackId {}".format(
-                                    device_id, thief["pingbackId"]
+                                "received telemetry serviceAckRequest from {} with serviceAckId {}".format(
+                                    device_id, thief["serviceAckId"]
                                 ),
                                 extra=custom_props(device_id, pairing_id),
                             )
-                            self.outgoing_pingback_response_queue.put(
-                                Pingback(device_id=device_id, pingback_id=thief.get("pingbackId"))
+                            self.outgoing_service_ack_response_queue.put(
+                                ServiceAck(
+                                    device_id=device_id, service_ack_id=thief.get("serviceAckId")
+                                )
                             )
                         else:
                             logger.warning(
-                                "unknown pingback type: {}. Ignoring.".format(pingback_type),
+                                "unknown ServiceAckType: {}. Ignoring.".format(service_ack_type),
                                 extra=custom_props(device_id, pairing_id),
                             )
                     else:
@@ -349,12 +353,12 @@ class ServiceApp(app_base.AppBase):
                                 "Send throtttled.  Time delta={} seconds".format(end - start)
                             )
 
-    def handle_pingback_request_thread(self, worker_thread_info):
+    def handle_service_ack_request_thread(self, worker_thread_info):
         """
-        Thread which is responsible for returning pingback response message to the
-        device clients.  The various pingbacks are collected in `outgoing_pingback_response_queue`
-        and this thread collects the pingbacks into batches to send at a regular interval.  This
-        batching is required because we send many pingbacks per second and IoTHub will throttle
+        Thread which is responsible for returning serviceAckResponse message to the
+        device clients.  The various serviceAcks are collected in `outgoing_service_ack_response_queue`
+        and this thread collects the serviceAcks into batches to send at a regular interval.  This
+        batching is required because we send many serviceAck responses per second and IoTHub will throttle
         C2d events if we send too many.  Sending fewer big messages is better than sending fewer
         small messages.
         """
@@ -365,53 +369,54 @@ class ServiceApp(app_base.AppBase):
                 time.sleep(1)
                 continue
 
-            pingbacks = {}
+            service_acks = {}
             while True:
                 try:
-                    pingback = self.outgoing_pingback_response_queue.get_nowait()
+                    service_ack = self.outgoing_service_ack_response_queue.get_nowait()
                 except queue.Empty:
                     break
-                if pingback.device_id not in pingbacks:
-                    pingbacks[pingback.device_id] = []
-                pingbacks[pingback.device_id].append({"pingbackId": pingback.pingback_id})
+                if service_ack.device_id not in service_acks:
+                    service_acks[service_ack.device_id] = []
+                service_acks[service_ack.device_id].append(
+                    {"serviceAckId": service_ack.service_ack_id}
+                )
 
-            if len(pingbacks):
-                for device_id in pingbacks:
+            for device_id in service_acks:
 
-                    with self.pairing_list_lock:
-                        if device_id in self.paired_devices:
-                            device_data = self.paired_devices[device_id]
-                        else:
-                            device_data = None
+                with self.pairing_list_lock:
+                    if device_id in self.paired_devices:
+                        device_data = self.paired_devices[device_id]
+                    else:
+                        device_data = None
 
-                    if device_data:
-                        pairing_id = device_data.pairing_id
+                if device_data:
+                    pairing_id = device_data.pairing_id
 
-                        logger.info(
-                            "send pingback for device_id = {}: {}".format(
-                                device_id, pingbacks[device_id]
-                            ),
-                            extra=custom_props(device_id, pairing_id),
-                        )
+                    logger.info(
+                        "send serviceAckResponse for device_id = {}: {}".format(
+                            device_id, service_acks[device_id]
+                        ),
+                        extra=custom_props(device_id, pairing_id),
+                    )
 
-                        message = json.dumps(
-                            {
-                                "thief": {
-                                    "cmd": "pingbackResponse",
-                                    "serviceRunId": run_id,
-                                    "pairingId": pairing_id,
-                                    "pingbacks": pingbacks[device_id],
-                                }
+                    message = json.dumps(
+                        {
+                            "thief": {
+                                "cmd": "serviceAckResponse",
+                                "serviceRunId": run_id,
+                                "pairingId": pairing_id,
+                                "serviceAcks": service_acks[device_id],
                             }
-                        )
+                        }
+                    )
 
-                        self.outgoing_c2d_queue.put(
-                            (
-                                device_id,
-                                message,
-                                {"contentType": "application/json", "contentEncoding": "utf-8"},
-                            )
+                    self.outgoing_c2d_queue.put(
+                        (
+                            device_id,
+                            message,
+                            {"contentType": "application/json", "contentEncoding": "utf-8"},
                         )
+                    )
 
             # TODO: this should be configurable
             # Too small and this causes C2D throttling
@@ -648,7 +653,7 @@ class ServiceApp(app_base.AppBase):
         properties contain content, such as properties that contain random strings which are
         used to test various features.
 
-        for `reportedPropertyTest` properties, this function will send pingback messages to the
+        for `reportedPropertyTest` properties, this function will send serviceAckResponse messages to the
         device when the property is added, and then again when the property is removed
         """
         device_id = get_device_id_from_event(event)
@@ -670,16 +675,16 @@ class ServiceApp(app_base.AppBase):
 
                 with device_data.reported_property_list_lock:
                     if property_value:
-                        pingback_id = property_value["addPingbackId"]
+                        service_ack_id = property_value["addServiceAckId"]
                         device_data.reported_property_values[property_name] = property_value
                     else:
-                        pingback_id = device_data.reported_property_values[property_name][
-                            "removePingbackId"
+                        service_ack_id = device_data.reported_property_values[property_name][
+                            "removeServiceAckId"
                         ]
                         del device_data.reported_property_values[property_name]
 
-                self.outgoing_pingback_response_queue.put(
-                    Pingback(device_id=device_id, pingback_id=pingback_id)
+                self.outgoing_service_ack_response_queue.put(
+                    ServiceAck(device_id=device_id, service_ack_id=service_ack_id)
                 )
 
     def respond_to_test_control_properties(self, event):
@@ -774,7 +779,7 @@ class ServiceApp(app_base.AppBase):
                 self.send_outgoing_c2d_messages_thread, "send_outgoing_c2d_messages_thread"
             ),
             app_base.WorkerThreadInfo(
-                self.handle_pingback_request_thread, "handle_pingback_request_thread"
+                self.handle_service_ack_request_thread, "handle_service_ack_request_thread"
             ),
             app_base.WorkerThreadInfo(self.test_c2d_thread, "test_c2d_thread"),
         ]

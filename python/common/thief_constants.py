@@ -3,7 +3,7 @@
 # full license information.
 
 
-class PingbackType(object):
-    TELEMETRY_PINGBACK = "telemetry"
-    ADD_REPORTED_PROPERTY_PINGBACK = "add_reported"
-    REMOVE_REPORTED_PROPERTY_PINGBACK = "remove_reported"
+class ServiceAckType(object):
+    TELEMETRY_SERVICE_ACK = "telemetry"
+    ADD_REPORTED_PROPERTY_SERVICE_ACK = "add_reported"
+    REMOVE_REPORTED_PROPERTY_SERVICE_ACK = "remove_reported"

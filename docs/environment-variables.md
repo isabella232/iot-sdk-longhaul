@@ -22,7 +22,7 @@ e.g. The environment variable `THIEF_SUBSCRIPTION_ID` is stored as a keyvault se
 ## Azure resources
 | variable name | service | device | developer | source | format | meaning |
 | - | - | - | - | - | - | - |
-| `THIEF_SUBSCRIPTION_ID` | - | - | X | keyvault | GUID | Azure subscription ID holding all THIEF resources | 
+| `THIEF_SUBSCRIPTION_ID` | - | - | X | keyvault | GUID | Azure subscription ID holding all THIEF resources |
 | `THIEF_ACTIVE_DIRECTORY_TENANT` | - | - | X | keyvault | hostname | Azure active directory tenant.  Uesd to consturct portal URLs. |
 | `THIEF_RESOURCE_GROUP` | - | - | X | keyvault | string | Name of resource group containing all THIEF resources |
 | `THIEF_RUNS_RESOURCE_GROUP` | - | - | X | keyvault | string |  Name of resource group containing all THIEF container instances |
@@ -37,7 +37,7 @@ e.g. The environment variable `THIEF_SUBSCRIPTION_ID` is stored as a keyvault se
 ## IoTHub Service
 | variable name | service | device | developer | source | format | meaning |
 | - | - | - | - | - | - | - |
-| `THIEF_IOTHUB_NAME` | - | - | X |  keyvault | string | Name of IoT Hub instance being used for testing |
+| `THIEF_IOTHUB_NAME` | X | - | X |  keyvault | string | Name of IoT Hub instance being used for testing |
 | `THIEF_SERVICE_CONNECTION_STRING` | X | - | X | keyvault | connection string | service connection strong for the IoT Hub instance being used for testing |
 
 ## EventHub
